@@ -262,6 +262,8 @@ def score_momentum(df):
 
 def build_scores(bundle):
     dxy_score, dxy_comment = score_dxy(bundle.get("dxy_pct"))
+    if bundle.get("dxy_source") == "PROXY:EURUSD_INVERSE":
+        dxy_comment = f"{dxy_comment} | Proxy kaynak: EUR/USD ters seri"
     rate_score, rate_comment = score_rates(
         bundle.get("us2y"),
         bundle.get("de2y"),

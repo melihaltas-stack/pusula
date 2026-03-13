@@ -290,12 +290,8 @@ def validate_market_bundle(bundle: dict) -> dict:
     """get_market_bundle() çıktısını toplu olarak doğrular.
 
     Returns:
-        {
-            "valid": bool,         # kritik veri var mı
-            "results": {...},      # her veri kaynağının ValidationResult'u
-            "warnings": [...],     # tüm uyarılar birleşik
-            "errors": [...],       # tüm hatalar birleşik
-        }
+        Original bundle enriched with validation metadata so engine can
+        keep using the market fields directly.
     """
     results = {}
     all_warnings = []
@@ -355,9 +351,17 @@ def validate_market_bundle(bundle: dict) -> dict:
     # EUR/USD 1D olmadan EDE hesaplanamaz
     critical_ok = results.get("eur_1d", ValidationResult(valid=False)).valid
 
-    return {
+    summary = {
         "valid": critical_ok,
-        "results": results,
+        "warning_count": len(all_warnings),
+        "error_count": len(all_errors),
         "warnings": all_warnings,
         "errors": all_errors,
+    }
+
+    return {
+        **bundle,
+        "validation_results": results,
+        "validation_flags": all_warnings + all_errors,
+        "validation_summary": summary,
     }

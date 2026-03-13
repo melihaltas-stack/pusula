@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 decision_log.csv
+.DS_Store
+logs/
+data_cache/

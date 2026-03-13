@@ -1,6 +1,9 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import logging
 
+logger = logging.getLogger(__name__)
+from core.data_sources import get_market_bundle
 from core.indicators import technical_snapshot, detect_trend_regime, timeframe_snapshot
 from core.scoring import build_scores
 from planner.planner import build_sale_plan
@@ -41,8 +44,8 @@ def classify_confidence(data_quality_score):
     return "Düşük"
 
 
-def build_weights():
-    return {
+def build_weights(dxy_source=None):
+    weights = {
         "DXY": 0.22,
         "Faiz": 0.18,
         "Risk": 0.12,
@@ -52,9 +55,18 @@ def build_weights():
         "MacroRisk": 0.07,
     }
 
+    if dxy_source == "PROXY:EURUSD_INVERSE":
+        # Proxy DXY yön hissi verir ama gerçek endeks kadar güvenilir değildir.
+        weights["DXY"] = 0.08
+        weights["Risk"] = 0.17
+        weights["Teknik"] = 0.27
+        weights["Form"] = 0.15
 
-def calculate_ede(scores):
-    weights = build_weights()
+    return weights
+
+
+def calculate_ede(scores, dxy_source=None):
+    weights = build_weights(dxy_source=dxy_source)
     ede = 0.0
     for key, weight in weights.items():
         ede += scores.get(key, 50) * weight
@@ -84,7 +96,8 @@ def build_next_macro_event_text(events):
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=LOCAL_TZ)
             dt = dt.astimezone(LOCAL_TZ)
-        except Exception:
+        except (ValueError, AttributeError, OSError) as e:
+            logger.debug("build_next_macro_event_text: tarih parse hatası event=%r err=%s", event, e)
             continue
 
         hours = (dt - now).total_seconds() / 3600
@@ -144,120 +157,28 @@ Sistem ayrıca **veri güven skoru** üretir ve benzer tarihsel koşullara göre
 """
 
 
-
-
-def build_forecast(probability, ede, trend_regime):
-    """
-    Mevcut backtest/probability verisini kullanarak
-    app.py'nin beklediği forecast dict'ini üretir.
-    """
-    if not probability or probability.get("sample_size", 0) == 0:
-        return None
-
-    horizons_raw = probability.get("horizons", {})
-    if not horizons_raw:
-        return None
-
-    horizons = {}
-    for h, data in horizons_raw.items():
-        down_prob = data.get("down_probability", 50.0)
-        avg_ret = data.get("avg_return", 0.0)
-
-        # Yön tahmini
-        if down_prob >= 55:
-            direction = "DOWN"
-            emoji = "🔴"
-            probability_val = down_prob
-        elif down_prob <= 45:
-            direction = "UP"
-            emoji = "🟢"
-            probability_val = 100 - down_prob
-        else:
-            direction = "NEUTRAL"
-            emoji = "🟡"
-            probability_val = 50.0
-
-        # Basit güven aralığı (±%5 yaklaşımı)
-        margin = 5.0
-        ci_lower = round(max(0, probability_val - margin), 1)
-        ci_upper = round(min(100, probability_val + margin), 1)
-
-        # Güvenilirlik: sample_size > 30 ve olasılık > 55 ise güvenilir
-        reliable = probability.get("sample_size", 0) >= 30 and probability_val >= 55
-
-        horizons[h] = {
-            "direction": direction,
-            "emoji": emoji,
-            "probability": round(probability_val, 1),
-            "ci_lower": ci_lower,
-            "ci_upper": ci_upper,
-            "avg_return": avg_ret,
-            "reliable": reliable,
-        }
-
-    sample_size = probability.get("sample_size", 0)
-    best_h = min(horizons.keys()) if horizons else 3
-    best = horizons.get(best_h, {})
-
-    summary = (
-        f"Benzer {sample_size} tarihsel koşul analiz edildi. "
-        f"{best_h}G tahmini: {best.get('emoji','')} {best.get('direction','')} "
-        f"(%{best.get('probability', 0):.0f} olasılık). "
-        f"Trend rejimi: {trend_regime}."
-    )
-
-    return {
-        "sample_size": sample_size,
-        "model_type": "Tarihsel Olasılık (Backtest)",
-        "summary": summary,
-        "horizons": horizons,
-    }
-
 def run_engine():
-    from core.data_sources import get_market_bundle
-    from core.validators import validate_market_bundle
-
     bundle = get_market_bundle()
-
-    # ── Veri doğrulama (Faz 1) ──
-    validation = validate_market_bundle(bundle)
-
-    if not validation["valid"]:
-        error_msg = "Kritik veri doğrulama hatası:\n" + "\n".join(validation["errors"])
-        return {"error": error_msg}
 
     eur_1d = bundle.get("eur_1d")
     if eur_1d is None or eur_1d.empty:
-        return {"error": "EUR/USD verisi alınamadı. Lütfen biraz sonra tekrar deneyin."}
+        return {
+            "error": "EUR/USD verisi alınamadı. Lütfen biraz sonra tekrar deneyin.",
+            "freshness": bundle.get("freshness"),
+            "data_quality": bundle.get("data_quality"),
+            "validation_flags": bundle.get("validation_flags", []),
+            "validation_summary": bundle.get("validation_summary", {}),
+        }
 
     scores, comments = build_scores(bundle)
-
-    # ── Rejim tespiti ve Adaptive EDE (Faz 2) ──
-    from regime.regime import detect_regime
-    from regime.adaptive_weights import calculate_adaptive_ede
-
-    regime_result = detect_regime(
-        eur_df=eur_1d,
-        vix=bundle.get("vix"),
-        dxy_pct=bundle.get("dxy_pct"),
-    )
-
-    adaptive = calculate_adaptive_ede(scores, regime_result["regime"])
-
-    # Adaptive EDE ana skor olarak kullanılır
-    ede = adaptive["adaptive_ede"]
-    static_ede = adaptive["static_ede"]
-
+    ede = calculate_ede(scores, dxy_source=bundle.get("dxy_source"))
     decision = classify_decision(ede)
 
     data_quality = bundle.get("data_quality", {})
     data_quality_score = data_quality.get("score", 0)
     confidence_label = classify_confidence(data_quality_score)
 
-    # Eski trend_regime uyumluluk için korunuyor
-    trend_regime = regime_result["trend_direction"]
-    market_regime = regime_result["regime"]
-
+    trend_regime = detect_trend_regime(eur_1d)
     sale_plan = build_sale_plan(ede, trend_regime, scores.get("MacroRisk", 50))
 
     technical = technical_snapshot(eur_1d)
@@ -285,6 +206,8 @@ def run_engine():
         "support": bundle.get("support"),
         "resistance": bundle.get("resistance"),
         "dxy_pct": bundle.get("dxy_pct"),
+        "dxy_source": bundle.get("dxy_source"),
+        "weights": build_weights(dxy_source=bundle.get("dxy_source")),
         "vix": bundle.get("vix"),
         "us2y": bundle.get("us2y"),
         "us10y": bundle.get("us10y"),
@@ -307,14 +230,6 @@ def run_engine():
         "scores": scores,
         "yorumlar": comments,
         "ede": ede,
-        "static_ede": static_ede,
-        "ede_delta": adaptive["delta"],
-        "market_regime": market_regime,
-        "regime_confidence": regime_result["confidence"],
-        "regime_description": regime_result["description"],
-        "adaptive_explanation": adaptive["explanation"],
-        "adaptive_weights": adaptive["weights_used"],
-        "adaptive_contribution": adaptive["contribution"],
         "karar": decision["karar"],
         "renk": decision["renk"],
         "emoji": decision["emoji"],
@@ -328,11 +243,11 @@ def run_engine():
         "sale_plan": sale_plan,
         "probability": probability,
         "formula_box_text": formula_box_text,
-        "validation_warnings": validation["warnings"],
-        "validation_errors": validation["errors"],
+        "freshness": bundle.get("freshness"),
+        "validation_flags": bundle.get("validation_flags", []),
+        "validation_summary": bundle.get("validation_summary", {}),
     }
 
-    result["forecast"] = build_forecast(probability, ede, trend_regime)
     result["risk_note"] = build_risk_note(result)
     result["operation_summary"] = build_operation_summary(result)
     result["debug"] = {
@@ -341,34 +256,18 @@ def run_engine():
             "us10y_source": result["us10y_source"],
             "de2y_source": result["de2y_source"],
             "de10y_source": result["de10y_source"],
+            "dxy_source": result["dxy_source"],
             "macro_source": result["macro_source"],
         },
         "scores": scores,
+        "weights": result["weights"],
         "comments": comments,
         "data_quality": data_quality,
         "trend_regime": trend_regime,
-        "market_regime": market_regime,
-        "regime_detail": {
-            "regime": regime_result["regime"],
-            "confidence": regime_result["confidence"],
-            "signals": {
-                "risk_on": regime_result["signals"].risk_on_score,
-                "risk_off": regime_result["signals"].risk_off_score,
-                "trend": regime_result["signals"].trend_score,
-                "range": regime_result["signals"].range_score,
-            },
-            "inputs": regime_result["inputs"],
-        },
-        "adaptive_ede": {
-            "adaptive": adaptive["adaptive_ede"],
-            "static": adaptive["static_ede"],
-            "delta": adaptive["delta"],
-        },
         "probability": probability,
-        "validation": {
-            "warnings": validation["warnings"],
-            "errors": validation["errors"],
-        },
+        "validation_summary": bundle.get("validation_summary", {}),
+        "validation_flags": bundle.get("validation_flags", []),
+        "freshness_summary": bundle["freshness"].summary_text if bundle.get("freshness") else "N/A",
     }
 
     return result

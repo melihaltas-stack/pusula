@@ -56,19 +56,17 @@ katmanları hiçbir zaman `streamlit` import etmez. Bu sayede:
 ## Çalıştırma
 
 ```bash
-pip install -r requirements.txt
-cd selvese
-python -m streamlit run ui/app.py
+cd /Users/melihaltas/Desktop/Pusula
+python3 -m streamlit run app.py
 ```
 
 ## Smoke Test (UI olmadan)
 
-```python
-# Engine'in UI bağımlılığı olmadan çalıştığını doğrula
-from engine.engine import calculate_ede, classify_decision, build_weights
-from core.indicators import rsi, macd, sma
-from planner.planner import build_sale_plan
-from backtest.backtest import build_probability_summary
-
-print("Tüm katmanlar UI bağımsız import edildi.")
+```bash
+cd /Users/melihaltas/Desktop/Pusula
+python3 tests/smoke_check.py
 ```
+
+Notlar:
+- `DXY` canlı veri gelmezse sistem `PROXY:EURUSD_INVERSE` kaynağına düşebilir.
+- `EUR/USD 4H` veri gelmezse `1H -> 4H` birleştirme kullanılır.
