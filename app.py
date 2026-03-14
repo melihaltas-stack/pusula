@@ -9,7 +9,7 @@ from logging_config import setup_logging
 setup_logging()
 
 from engine import run_engine, build_report_text
-from logger import log_daily_decision, read_decision_log, build_treasury_metrics
+from logger import log_daily_decision, read_decision_log, build_treasury_metrics, build_factor_contribution_summary
 
 
 _DETAIL_LOCK = threading.Lock()
@@ -67,6 +67,13 @@ def format_age_text(age_seconds):
     if minutes == 0:
         return f"{hours} sa"
     return f"{hours} sa {minutes} dk"
+
+
+def should_start_background_detail_report(manual_inputs=None):
+    if manual_inputs:
+        return False
+    cached_detail = load_detail_report_cache()
+    return cached_detail is None
 
 
 def save_detail_report_cache(result):
@@ -533,7 +540,11 @@ if refresh:
             st.session_state.detail_task_mode = "sync"
             save_detail_report_cache(st.session_state.data)
         else:
-            start_background_detail_report()
+            if should_start_background_detail_report():
+                start_background_detail_report()
+            else:
+                st.session_state.detail_task_key = None
+                st.session_state.detail_task_mode = "cached"
         st.session_state.loaded_from_detail_cache = False
         st.session_state.detail_cache_age_seconds = None
 
@@ -592,7 +603,8 @@ if manual_requirements:
                     st.session_state.detail_task_mode = "sync"
                     save_detail_report_cache(st.session_state.data)
                 else:
-                    start_background_detail_report(manual_inputs=manual_inputs)
+                    st.session_state.detail_task_key = None
+                    st.session_state.detail_task_mode = "manual-fast"
                 st.session_state.loaded_from_detail_cache = False
                 st.session_state.detail_cache_age_seconds = None
             st.rerun()
@@ -618,10 +630,16 @@ if d.get("fast_mode"):
         '<div style="background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.28);'
         'border-radius:12px;padding:12px 14px;margin-bottom:12px;color:#d1fae5;">'
         '<b>Hızlı mod açık</b> &nbsp;|&nbsp; Uygulama temel karar akışını hızlandırmak için geniş factor seti ve performans raporunu atladı. '
-        'Tam Faz-1 görünümü için sağ üstten <b>Detaylı mod</b> açılabilir.'
+        'Planlı detaylı rapor cache\'i kullanılır; gereksiz yere yeni rapor üretilmez.'
         '</div>',
         unsafe_allow_html=True,
     )
+
+detail_refresh_col, _ = st.columns([1, 4])
+with detail_refresh_col:
+    if st.button("🧠 Detaylı Raporu Yenile"):
+        start_background_detail_report()
+        st.rerun()
 
 
 
@@ -724,6 +742,7 @@ if _dxy_source == "PROXY:EURUSD_INVERSE":
 # Treasury log ve metrikler
 log_df = read_decision_log()
 treasury_metrics = build_treasury_metrics(log_df)
+factor_summary = build_factor_contribution_summary(log_df)
 
 horizon_views = d.get("horizon_views", {})
 if horizon_views:
@@ -1102,14 +1121,55 @@ with k4:
         sub="Tahmini katkı"
     )
 
+l1, l2, l3 = st.columns(3)
+
+with l1:
+    render_metric_card(
+        "Ortalama EDE",
+        f"{treasury_metrics['avg_ede']}",
+        sub="Loglanan kararlar bazlı"
+    )
+
+with l2:
+    render_metric_card(
+        "Ortalama Veri Güveni",
+        f"{treasury_metrics['avg_data_quality']}/100",
+        sub="Karar kalitesi göstergesi"
+    )
+
+with l3:
+    render_metric_card(
+        "Yüksek Güven Oranı",
+        f"%{treasury_metrics['high_confidence_rate']}",
+        sub="Confidence=Yüksek gün oranı"
+    )
+
+st.markdown('<div class="panel-card">', unsafe_allow_html=True)
+st.markdown("### Son 30 Gün Factor Katkı Özeti")
+st.write(factor_summary.get("summary", "Factor özeti yok."))
+
+leaders = factor_summary.get("leaders", [])
+if leaders:
+    fcols = st.columns(len(leaders))
+    for i, item in enumerate(leaders):
+        with fcols[i]:
+            st.metric(item["label"], f"{item['avg_score']}", f"{item['deviation']:+.1f}")
+            st.caption(f"Yüksek gün: {item['high_days']} | Düşük gün: {item['low_days']}")
+else:
+    st.caption("Yeterli log birikmediğinde bu alan boş kalabilir.")
+st.markdown('</div>', unsafe_allow_html=True)
+
 st.markdown('<div class="panel-card">', unsafe_allow_html=True)
 st.markdown("### Son Kararlar ve Operasyon Geçmişi")
 
 if not log_df.empty:
     display_cols = [
-        "date", "ede", "trend", "spot",
-        "daily_units", "morning_units", "afternoon_units", "decision"
+        "timestamp", "active_horizon_label", "ede", "trend", "spot",
+        "data_quality_score", "daily_units", "morning_units", "afternoon_units", "decision"
     ]
+    for col in display_cols:
+        if col not in log_df.columns:
+            log_df[col] = None
     st.dataframe(log_df[display_cols].tail(15), use_container_width=True, hide_index=True)
 else:
     st.info("Henüz log kaydı yok. 'Bugünkü Kararı Logla' butonunu kullan.")

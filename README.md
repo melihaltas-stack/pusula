@@ -32,6 +32,13 @@ Kurumsal FX desk yaklaşımına yakınlaşmak için hazırlanmış uygulama road
 
 - `INSTITUTIONAL_FX_ROADMAP.md`
 
+## Deploy
+
+Kısa production deploy notu ve kontrol adımları:
+
+- `DEPLOY.md`
+- `scripts/deploy_check.sh`
+
 ## Katman Kuralları
 
 | Katman   | UI Import? | Engine Import? | Dış API? |
