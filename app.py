@@ -358,6 +358,20 @@ def render_score_block(name, value, comment):
     )
 
 
+def render_horizon_summary(view):
+    st.markdown(
+        f"""
+        <div class="plan-box">
+            <div class="plan-title">{view['label']} • {view['window']}</div>
+            <div class="plan-main">{view['emoji']} {view['karar']}</div>
+            <div class="plan-text">EDE: <b>{view['ede']}</b> | Plan: <b>{view['sale_plan']['daily_units']}/100</b></div>
+            <div class="info-box">{view['summary']}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 st.title("🧭 Selvese EUR Satış Pusulası")
 st.caption("Kurumsal EUR satış yönetimi için açıklanabilir operasyon paneli")
 st.markdown(
@@ -509,8 +523,24 @@ if _dxy_source == "PROXY:EURUSD_INVERSE":
 log_df = read_decision_log()
 treasury_metrics = build_treasury_metrics(log_df)
 
+horizon_views = d.get("horizon_views", {})
+if horizon_views:
+    st.markdown("## Vade Görünümü")
+    tab_short, tab_medium, tab_long = st.tabs([
+        "Kısa Vade 1-5 gün",
+        "Orta Vade 1-3 hafta",
+        "Uzun Vade 4+ hafta",
+    ])
+
+    with tab_short:
+        render_horizon_summary(horizon_views["short_term"])
+    with tab_medium:
+        render_horizon_summary(horizon_views["medium_term"])
+    with tab_long:
+        render_horizon_summary(horizon_views["long_term"])
+
 # ANA OPERASYON EKRANI
-st.markdown("## Ana Operasyon Ekranı")
+st.markdown(f"## Ana Operasyon Ekranı • {d.get('active_horizon_label', 'Kısa Vade')}")
 
 left, right = st.columns([1.05, 1.95])
 

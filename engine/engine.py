@@ -44,33 +44,92 @@ def classify_confidence(data_quality_score):
     return "Düşük"
 
 
-def build_weights(dxy_source=None):
-    weights = {
-        "DXY": 0.22,
-        "Faiz": 0.18,
-        "Risk": 0.12,
-        "Teknik": 0.22,
-        "Form": 0.12,
-        "Volatilite": 0.07,
-        "MacroRisk": 0.07,
+HORIZON_META = {
+    "short_term": {"label": "Kısa Vade", "window": "1-5 gün"},
+    "medium_term": {"label": "Orta Vade", "window": "1-3 hafta"},
+    "long_term": {"label": "Uzun Vade", "window": "4+ hafta"},
+}
+
+
+def build_weights(horizon="medium_term", dxy_source=None):
+    horizon_weights = {
+        "short_term": {
+            "DXY": 0.14,
+            "Faiz": 0.06,
+            "Risk": 0.14,
+            "Teknik": 0.20,
+            "Form": 0.08,
+            "Volatilite": 0.08,
+            "MacroRisk": 0.06,
+            "Momentum": 0.24,
+        },
+        "medium_term": {
+            "DXY": 0.17,
+            "Faiz": 0.16,
+            "Risk": 0.12,
+            "Teknik": 0.18,
+            "Form": 0.10,
+            "Volatilite": 0.07,
+            "MacroRisk": 0.07,
+            "Momentum": 0.13,
+        },
+        "long_term": {
+            "DXY": 0.12,
+            "Faiz": 0.20,
+            "Risk": 0.08,
+            "Teknik": 0.12,
+            "Form": 0.18,
+            "Volatilite": 0.05,
+            "MacroRisk": 0.10,
+            "Momentum": 0.15,
+        },
     }
+
+    weights = horizon_weights.get(horizon, horizon_weights["medium_term"]).copy()
 
     if dxy_source == "PROXY:EURUSD_INVERSE":
         # Proxy DXY yön hissi verir ama gerçek endeks kadar güvenilir değildir.
-        weights["DXY"] = 0.08
-        weights["Risk"] = 0.17
-        weights["Teknik"] = 0.27
-        weights["Form"] = 0.15
+        lost = weights["DXY"] - 0.06
+        weights["DXY"] = 0.06
+        weights["Risk"] += lost * 0.35
+        weights["Teknik"] += lost * 0.35
+        weights["Momentum"] += lost * 0.30
 
     return weights
 
 
-def calculate_ede(scores, dxy_source=None):
-    weights = build_weights(dxy_source=dxy_source)
+def calculate_ede(scores, horizon="medium_term", dxy_source=None, trend_regime=None):
+    weights = build_weights(horizon=horizon, dxy_source=dxy_source)
     ede = 0.0
     for key, weight in weights.items():
         ede += scores.get(key, 50) * weight
+    if trend_regime == "DOWN":
+        if horizon == "short_term":
+            ede += 8
+        elif horizon == "medium_term":
+            ede += 4
+    elif trend_regime == "UP":
+        if horizon == "short_term":
+            ede -= 8
+        elif horizon == "medium_term":
+            ede -= 4
     return round(ede, 1)
+
+
+def classify_horizon_decision(ede_score, horizon="medium_term"):
+    thresholds = {
+        "short_term": (58, 48, 38),
+        "medium_term": (65, 52, 40),
+        "long_term": (68, 55, 43),
+    }
+    strong, ready, prep = thresholds.get(horizon, thresholds["medium_term"])
+    if ede_score >= strong:
+        return {"karar": "Güçlü satış penceresi", "renk": "sat", "emoji": "🟢"}
+    if ede_score >= ready:
+        return {"karar": "Kademeli satış uygun", "renk": "hazirlan", "emoji": "🟡"}
+    if ede_score >= prep:
+        return {"karar": "Hazırlan", "renk": "hazirlan", "emoji": "🟠"}
+    return {"karar": "Bekle", "renk": "bekle", "emoji": "🔵"}
 
 
 def build_spread(us, de):
@@ -135,6 +194,28 @@ def build_operation_summary(d):
     )
 
 
+def build_horizon_view(horizon, scores, dxy_source, trend_regime, macro_score):
+    meta = HORIZON_META[horizon]
+    ede = calculate_ede(scores, horizon=horizon, dxy_source=dxy_source, trend_regime=trend_regime)
+    decision = classify_horizon_decision(ede, horizon=horizon)
+    sale_plan = build_sale_plan(ede, trend_regime, macro_score, horizon=horizon)
+    sorted_weights = sorted(build_weights(horizon=horizon, dxy_source=dxy_source).items(), key=lambda x: x[1], reverse=True)
+    focus = ", ".join(name for name, _ in sorted_weights[:3])
+    summary = f"{meta['label']} ({meta['window']}) icin ana odak: {focus}."
+    return {
+        "key": horizon,
+        "label": meta["label"],
+        "window": meta["window"],
+        "ede": ede,
+        "karar": decision["karar"],
+        "renk": decision["renk"],
+        "emoji": decision["emoji"],
+        "sale_plan": sale_plan,
+        "weights": build_weights(horizon=horizon, dxy_source=dxy_source),
+        "summary": summary,
+    }
+
+
 formula_box_text = """
 ### 🧠 Bu skor nasıl hesaplanıyor?
 
@@ -171,15 +252,30 @@ def run_engine(manual_inputs=None):
         }
 
     scores, comments = build_scores(bundle)
-    ede = calculate_ede(scores, dxy_source=bundle.get("dxy_source"))
-    decision = classify_decision(ede)
+    trend_regime = detect_trend_regime(eur_1d)
+    horizon_views = {
+        key: build_horizon_view(
+            key,
+            scores,
+            bundle.get("dxy_source"),
+            trend_regime,
+            scores.get("MacroRisk", 50),
+        )
+        for key in ["short_term", "medium_term", "long_term"]
+    }
+    primary_horizon = horizon_views["short_term"]
+    ede = primary_horizon["ede"]
+    decision = {
+        "karar": primary_horizon["karar"],
+        "renk": primary_horizon["renk"],
+        "emoji": primary_horizon["emoji"],
+    }
 
     data_quality = bundle.get("data_quality", {})
     data_quality_score = data_quality.get("score", 0)
     confidence_label = classify_confidence(data_quality_score)
 
-    trend_regime = detect_trend_regime(eur_1d)
-    sale_plan = build_sale_plan(ede, trend_regime, scores.get("MacroRisk", 50))
+    sale_plan = primary_horizon["sale_plan"]
 
     technical = technical_snapshot(eur_1d)
     tf_daily = timeframe_snapshot(eur_1d, min_len=100)
@@ -208,7 +304,9 @@ def run_engine(manual_inputs=None):
         "dxy_pct": bundle.get("dxy_pct"),
         "dxy_source": bundle.get("dxy_source"),
         "manual_mode": bundle.get("manual_mode", False),
-        "weights": build_weights(dxy_source=bundle.get("dxy_source")),
+        "active_horizon": primary_horizon["key"],
+        "active_horizon_label": primary_horizon["label"],
+        "weights": primary_horizon["weights"],
         "vix": bundle.get("vix"),
         "us2y": bundle.get("us2y"),
         "us10y": bundle.get("us10y"),
@@ -242,6 +340,7 @@ def run_engine(manual_inputs=None):
         "tf_daily": tf_daily,
         "tf_4h": tf_4h,
         "sale_plan": sale_plan,
+        "horizon_views": horizon_views,
         "probability": probability,
         "formula_box_text": formula_box_text,
         "freshness": bundle.get("freshness"),

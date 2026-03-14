@@ -1,9 +1,16 @@
-def base_units_from_ede(ede):
-    if ede >= 65:
+def base_units_from_ede(ede, horizon="medium_term"):
+    thresholds = {
+        "short_term": (58, 48, 38),
+        "medium_term": (65, 52, 40),
+        "long_term": (68, 55, 43),
+    }
+    strong, ready, prep = thresholds.get(horizon, thresholds["medium_term"])
+
+    if ede >= strong:
         return 85, "Güçlü satış penceresi"
-    if ede >= 52:
+    if ede >= ready:
         return 50, "Kademeli satış uygun"
-    if ede >= 40:
+    if ede >= prep:
         return 30, "Hazırlan / teyit bekle"
     return 15, "Zayıf satış günü"
 
@@ -35,8 +42,8 @@ def split_execution(units):
     return morning, afternoon
 
 
-def build_sale_plan(ede, trend_regime, macro_score):
-    base_units, base_reason = base_units_from_ede(ede)
+def build_sale_plan(ede, trend_regime, macro_score, horizon="medium_term"):
+    base_units, base_reason = base_units_from_ede(ede, horizon=horizon)
     after_macro, macro_reason = apply_macro_brake(base_units, macro_score)
     final_units, trend_reason = apply_trend_adjustment(after_macro, trend_regime)
     morning_units, afternoon_units = split_execution(final_units)
