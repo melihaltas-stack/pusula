@@ -23,7 +23,6 @@ selvese/
 ├── planner/               # Satış planı katmanı
 ├── backtest/              # Tarihsel doğrulama
 ├── forecast/              # Özellik ve tahmin yardımcıları
-├── regime/                # Rejim deneyleri / adaptif ağırlıklar
 └── tests/                 # Smoke test
 ```
 
