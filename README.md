@@ -6,32 +6,25 @@ karar destek sistemidir.
 
 ## Mimari
 
-```
+```text
 selvese/
-├── core/                  # Veri ve hesaplama katmanı (UI bağımsız)
-│   ├── data_sources.py    # Canlı piyasa verisi (Yahoo, FRED, ECB, FMP)
-│   ├── indicators.py      # Teknik göstergeler (RSI, MACD, ATR, MA)
-│   └── scoring.py         # Alt skor hesaplama (DXY, Faiz, Risk, vb.)
-│
-├── engine/                # Orkestrasyon katmanı
-│   └── engine.py          # EDE hesaplama, karar sınıflandırma, rapor
-│
-├── planner/               # Satış planı katmanı
-│   └── planner.py         # Birim hesaplama, makro fren, trend ayarı
-│
-├── backtest/              # Tarihsel doğrulama
-│   └── backtest.py        # Olasılık motoru, benzer koşul analizi
-│
-├── storage/               # Veri saklama
-│   └── logger.py          # Karar günlüğü, treasury metrikleri
-│
-├── ui/                    # Görsel katman (sadece Streamlit)
-│   └── app.py             # Dashboard arayüzü
-│
-├── api/                   # REST API (gelecek faz)
-├── tests/                 # Test altyapısı
+├── app.py                 # Streamlit dashboard
 ├── run.py                 # Streamlit entry point
-└── requirements.txt
+├── requirements.txt
+├── logger.py              # Karar günlüğü ve treasury metrikleri
+├── logging_config.py
+├── freshness.py
+├── core/                  # Veri ve hesaplama katmanı
+│   ├── data_sources.py
+│   ├── indicators.py
+│   ├── scoring.py
+│   └── validators.py
+├── engine/                # Orkestrasyon katmanı
+├── planner/               # Satış planı katmanı
+├── backtest/              # Tarihsel doğrulama
+├── forecast/              # Özellik ve tahmin yardımcıları
+├── regime/                # Rejim deneyleri / adaptif ağırlıklar
+└── tests/                 # Smoke test
 ```
 
 ## Katman Kuralları
@@ -42,15 +35,12 @@ selvese/
 | engine/  | HAYIR     | core, planner, backtest | HAYIR |
 | planner/ | HAYIR     | HAYIR          | HAYIR    |
 | backtest/| HAYIR     | core (indicators) | HAYIR |
-| storage/ | HAYIR     | HAYIR          | HAYIR    |
-| ui/      | EVET      | engine, storage | HAYIR   |
-| api/     | HAYIR     | engine, storage | HAYIR   |
+| app.py   | EVET      | engine, logger | HAYIR   |
 
-**Temel kural:** `core/`, `engine/`, `planner/`, `backtest/`, `storage/`
+**Temel kural:** `core/`, `engine/`, `planner/`, `backtest/`
 katmanları hiçbir zaman `streamlit` import etmez. Bu sayede:
 
 - Engine bağımsız test edilebilir
-- API katmanı aynı core'u kullanabilir
 - CI/CD pipeline'da Streamlit kurulumu gerekmez
 
 ## Çalıştırma
