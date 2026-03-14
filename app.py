@@ -238,6 +238,37 @@ def pretty_source_key(key):
     return labels.get(key, key)
 
 
+def build_manual_requirements(result):
+    validation = result.get("validation_results", {}) if isinstance(result, dict) else {}
+    required = []
+
+    checks = [
+        ("spot", "EUR/USD Spot", "manual_spot", 1.14165, "%.5f", 0.0001),
+        ("dxy_pct", "DXY Degisim %", "manual_dxy_pct", 0.75, "%.2f", 0.01),
+        ("vix", "VIX", "manual_vix", 27.18, "%.2f", 0.01),
+        ("us2y", "US 2Y", "manual_us2y", 3.729, "%.3f", 0.001),
+        ("us10y", "US 10Y", "manual_us10y", 4.283, "%.3f", 0.001),
+    ]
+
+    for key, label, state_key, fallback, fmt, step in checks:
+        vr = validation.get(key)
+        current = result.get(key)
+        invalid = vr is not None and not getattr(vr, "valid", False)
+        if current is None or invalid:
+            required.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "state_key": state_key,
+                    "value": fallback if current is None else current,
+                    "format": fmt,
+                    "step": step,
+                }
+            )
+
+    return required
+
+
 def confidence_badge(label):
     if label == "Yüksek":
         return '<span class="mini-badge badge-high">Veri Güveni: Yüksek</span>'
@@ -332,53 +363,31 @@ st.caption("Kurumsal EUR satış yönetimi için açıklanabilir operasyon panel
 st.markdown(
     '<div style="background:rgba(96,165,250,0.12);border:1px solid rgba(96,165,250,0.30);'
     'border-radius:12px;padding:12px 14px;margin:8px 0 14px 0;color:#dbeafe;">'
-    '<b>Hızlı Kullanım Önerisi</b> &nbsp;|&nbsp; En hızlı sonuç için Hızlı Mod açık kalsın ve üstteki 5 veriyi manuel girin.'
+    '<b>Akıllı Akış</b> &nbsp;|&nbsp; Uygulama önce otomatik veriyi dener. Eksik kalan kritik alanlar olursa aşağıda sadece onları manuel ister.'
     '</div>',
     unsafe_allow_html=True,
 )
 
-with st.expander("⚡ Hizli Mod (Manuel Veri)", expanded=True):
-    manual_mode = st.toggle("Hizli modu kullan", value=True)
-    manual_note = "Hizli mod aktifteyken Spot, DXY, VIX, US2Y ve US10Y kullanici girdilerinden alinir; agir canli istekler atlanir."
-    st.caption(manual_note)
-    mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5)
-    with mcol1:
-        manual_spot = st.number_input("EUR/USD Spot", min_value=0.0, value=1.14165, step=0.0001, format="%.5f")
-    with mcol2:
-        manual_dxy_pct = st.number_input("DXY Degisim %", value=0.75, step=0.01, format="%.2f")
-    with mcol3:
-        manual_vix = st.number_input("VIX", min_value=0.0, value=27.18, step=0.01, format="%.2f")
-    with mcol4:
-        manual_us2y = st.number_input("US 2Y", value=3.729, step=0.001, format="%.3f")
-    with mcol5:
-        manual_us10y = st.number_input("US 10Y", value=4.283, step=0.001, format="%.3f")
-
 top_left, top_mid, top_right = st.columns([2, 2, 3])
 
 with top_left:
-    refresh = st.button("🔄 Analizi Güncelle")
+    refresh = st.button("🔄 Otomatik Analizi Çalıştır")
 
 with top_mid:
     save_log = st.button("💾 Bugünkü Kararı Logla")
 
 if "data" not in st.session_state:
     st.session_state.data = None
+if "manual_requirements" not in st.session_state:
+    st.session_state.manual_requirements = []
 
 if refresh:
     with st.spinner("Motor çalışıyor, veriler toplanıyor..."):
-        manual_inputs = None
-        if manual_mode:
-            manual_inputs = {
-                "spot": manual_spot,
-                "dxy_pct": manual_dxy_pct,
-                "vix": manual_vix,
-                "us2y": manual_us2y,
-                "us10y": manual_us10y,
-            }
-        st.session_state.data = run_engine(manual_inputs=manual_inputs)
+        st.session_state.data = run_engine()
+        st.session_state.manual_requirements = build_manual_requirements(st.session_state.data)
 
 if st.session_state.data is None:
-    st.info("Önce 'Analizi Güncelle' butonuna bas.")
+    st.info("Önce 'Otomatik Analizi Çalıştır' butonuna bas.")
     st.stop()
 
 d = st.session_state.data
@@ -390,6 +399,40 @@ if not isinstance(d, dict):
 if d.get("error"):
     st.error(d["error"])
     st.stop()
+
+manual_requirements = st.session_state.manual_requirements
+if manual_requirements:
+    req_labels = ", ".join(item["label"] for item in manual_requirements)
+    st.markdown(
+        '<div style="background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.35);'
+        'border-radius:12px;padding:12px 14px;margin-bottom:12px;color:#fde68a;">'
+        f'<b>Eksik Canlı Veri</b> &nbsp;|&nbsp; Otomatik akış şu alanları tamamlayamadı: {req_labels}. '
+        'Aşağıdaki alanları doldurup analizi manuel tamamlayabilirsin.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    with st.expander("✍️ Eksik Verileri Manuel Tamamla", expanded=True):
+        st.caption("Sadece otomatik alınamayan alanlar gösteriliyor.")
+        cols = st.columns(min(len(manual_requirements), 5))
+        manual_inputs = {}
+        for idx, item in enumerate(manual_requirements):
+            with cols[idx % len(cols)]:
+                min_value = 0.0 if item["key"] in {"spot", "vix"} else None
+                kwargs = {
+                    "label": item["label"],
+                    "value": float(item["value"]),
+                    "step": item["step"],
+                    "format": item["format"],
+                    "key": item["state_key"],
+                }
+                if min_value is not None:
+                    kwargs["min_value"] = min_value
+                manual_inputs[item["key"]] = st.number_input(**kwargs)
+        if st.button("⚡ Eksik Verilerle Analizi Tamamla"):
+            with st.spinner("Eksik verilerle analiz tamamlanıyor..."):
+                st.session_state.data = run_engine(manual_inputs=manual_inputs)
+                st.session_state.manual_requirements = build_manual_requirements(st.session_state.data)
+            st.rerun()
 
 if save_log:
     path = log_daily_decision(d)
@@ -450,7 +493,7 @@ if _val_flags:
             st.warning(_f)
 
 if d.get("manual_mode"):
-    st.info("Manuel veri modu aktif: Spot, DXY, VIX, US2Y ve US10Y kullanıcı girdilerinden kullanıldı.")
+    st.info("Manuel veri tamamlama aktif: eksik kalan kritik alanlar kullanıcı girdilerinden kullanıldı.")
 
 _dxy_source = d.get("dxy_source")
 if _dxy_source == "PROXY:EURUSD_INVERSE":

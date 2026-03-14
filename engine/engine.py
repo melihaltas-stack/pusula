@@ -247,6 +247,7 @@ def run_engine(manual_inputs=None):
         "freshness": bundle.get("freshness"),
         "validation_flags": bundle.get("validation_flags", []),
         "validation_summary": bundle.get("validation_summary", {}),
+        "validation_results": bundle.get("validation_results", {}),
     }
 
     result["risk_note"] = build_risk_note(result)
