@@ -539,39 +539,65 @@ if horizon_views:
         unsafe_allow_html=True,
     )
     st.markdown("## Vade Görünümü")
-    tab_short, tab_medium, tab_long = st.tabs([
-        "Kısa Vade 1-5 gün",
-        "Orta Vade 1-3 hafta",
-        "Uzun Vade 4+ hafta",
-    ])
+    horizon_option_map = {
+        "Kısa Vade 1-5 gün": "short_term",
+        "Orta Vade 1-3 hafta": "medium_term",
+        "Uzun Vade 4+ hafta": "long_term",
+    }
+    selected_horizon_label = st.segmented_control(
+        "Vade seç",
+        options=list(horizon_option_map.keys()),
+        default="Kısa Vade 1-5 gün",
+        selection_mode="single",
+    )
+    selected_horizon_key = horizon_option_map.get(selected_horizon_label, "short_term")
+    selected_view = horizon_views[selected_horizon_key]
+    render_horizon_summary(selected_view)
+else:
+    selected_horizon_key = d.get("active_horizon", "short_term")
+    selected_view = None
 
-    with tab_short:
-        render_horizon_summary(horizon_views["short_term"])
-    with tab_medium:
-        render_horizon_summary(horizon_views["medium_term"])
-    with tab_long:
-        render_horizon_summary(horizon_views["long_term"])
+if selected_view is not None:
+    dashboard_decision = {
+        "ede": selected_view["ede"],
+        "karar": selected_view["karar"],
+        "renk": selected_view["renk"],
+        "emoji": selected_view["emoji"],
+        "sale_plan": selected_view["sale_plan"],
+        "weights": selected_view["weights"],
+        "active_horizon_label": selected_view["label"],
+    }
+else:
+    dashboard_decision = {
+        "ede": d["ede"],
+        "karar": d["karar"],
+        "renk": d["renk"],
+        "emoji": d["emoji"],
+        "sale_plan": d["sale_plan"],
+        "weights": d["weights"],
+        "active_horizon_label": d.get("active_horizon_label", "Kısa Vade"),
+    }
 
 # ANA OPERASYON EKRANI
-st.markdown(f"## Ana Operasyon Ekranı • {d.get('active_horizon_label', 'Kısa Vade')}")
+st.markdown(f"## Ana Operasyon Ekranı • {dashboard_decision['active_horizon_label']}")
 
 left, right = st.columns([1.05, 1.95])
 
 with left:
-    st.plotly_chart(barometre(d["ede"], d["karar"], d["renk"]), use_container_width=True)
+    st.plotly_chart(barometre(dashboard_decision["ede"], dashboard_decision["karar"], dashboard_decision["renk"]), use_container_width=True)
 
     render_metric_card(
         "EUR/USD Spot",
         fmt_num(d["spot"], 4),
         sub=confidence_badge(d["confidence_label"]),
-        status_class=d["renk"]
+        status_class=dashboard_decision["renk"]
     )
 
     render_metric_card(
         "Günlük Satış Planı",
-        f"{d['sale_plan']['daily_units']} / 100",
-        sub=f"Sabah {d['sale_plan']['morning_units']} • Öğleden sonra {d['sale_plan']['afternoon_units']}",
-        status_class=d["renk"]
+        f"{dashboard_decision['sale_plan']['daily_units']} / 100",
+        sub=f"Sabah {dashboard_decision['sale_plan']['morning_units']} • Öğleden sonra {dashboard_decision['sale_plan']['afternoon_units']}",
+        status_class=dashboard_decision["renk"]
     )
 
     render_metric_card(
@@ -585,8 +611,13 @@ with right:
         f"""
         <div class="plan-box">
             <div class="plan-title">Bugünün Satış Planı</div>
-            <div class="plan-main">{d['sale_plan']['plan_label']}</div>
-            <div class="plan-text">{d['operation_summary']}</div>
+            <div class="plan-main">{dashboard_decision['sale_plan']['plan_label']}</div>
+            <div class="plan-text">
+                Seçili vade: <b>{dashboard_decision['active_horizon_label']}</b><br>
+                Toplam {dashboard_decision['sale_plan']['daily_units']} birim satış önerilir;
+                {dashboard_decision['sale_plan']['morning_units']} birim sabah,
+                {dashboard_decision['sale_plan']['afternoon_units']} birim öğleden sonra uygulanabilir.
+            </div>
         </div>
         """,
         unsafe_allow_html=True
