@@ -6,7 +6,7 @@ def safe_float(x):
         if pd.isna(x):
             return None
         return float(x)
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
