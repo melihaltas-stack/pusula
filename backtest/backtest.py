@@ -4,6 +4,16 @@ from core.indicators import detect_trend_regime
 from backtest.confidence import add_confidence_to_horizons, format_probability_with_ci
 
 
+def _normalize_close_series(df):
+    if df is None or df.empty or "Close" not in df.columns:
+        return None
+
+    series = pd.to_numeric(df["Close"], errors="coerce").dropna().copy()
+    if isinstance(series.index, pd.DatetimeIndex) and series.index.tz is not None:
+        series.index = series.index.tz_convert("UTC").tz_localize(None)
+    return series
+
+
 def _band_from_ede(ede):
     if ede >= 65:
         return "65+"
@@ -50,10 +60,20 @@ def build_probability_summary(eur_df, dxy_df, vix_df, current_ede, current_regim
             "summary_text": "Olasılık analizi için veri yetersiz."
         }
 
+    eur_close = _normalize_close_series(eur_df)
+    dxy_close = _normalize_close_series(dxy_df)
+    vix_close = _normalize_close_series(vix_df)
+    if eur_close is None or dxy_close is None or vix_close is None:
+        return {
+            "sample_size": 0,
+            "horizons": {},
+            "summary_text": "Olasılık analizi için veri yetersiz."
+        }
+
     df = pd.DataFrame({
-        "eur_close": eur_df["Close"],
-        "dxy_close": dxy_df["Close"],
-        "vix_close": vix_df["Close"],
+        "eur_close": eur_close,
+        "dxy_close": dxy_close,
+        "vix_close": vix_close,
     }).dropna()
 
     if len(df) < 300:

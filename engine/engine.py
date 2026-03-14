@@ -157,8 +157,8 @@ Sistem ayrıca **veri güven skoru** üretir ve benzer tarihsel koşullara göre
 """
 
 
-def run_engine():
-    bundle = get_market_bundle()
+def run_engine(manual_inputs=None):
+    bundle = get_market_bundle(manual_inputs=manual_inputs)
 
     eur_1d = bundle.get("eur_1d")
     if eur_1d is None or eur_1d.empty:
@@ -207,6 +207,7 @@ def run_engine():
         "resistance": bundle.get("resistance"),
         "dxy_pct": bundle.get("dxy_pct"),
         "dxy_source": bundle.get("dxy_source"),
+        "manual_mode": bundle.get("manual_mode", False),
         "weights": build_weights(dxy_source=bundle.get("dxy_source")),
         "vix": bundle.get("vix"),
         "us2y": bundle.get("us2y"),

@@ -314,6 +314,22 @@ def render_score_block(name, value, comment):
 st.title("🧭 Selvese EUR Satış Pusulası")
 st.caption("Kurumsal EUR satış yönetimi için açıklanabilir operasyon paneli")
 
+with st.expander("⚡ Hizli Mod (Manuel Veri)", expanded=True):
+    manual_mode = st.toggle("Hizli modu kullan", value=True)
+    manual_note = "Hizli mod aktifteyken Spot, DXY, VIX, US2Y ve US10Y kullanici girdilerinden alinir; agir canli istekler atlanir."
+    st.caption(manual_note)
+    mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5)
+    with mcol1:
+        manual_spot = st.number_input("EUR/USD Spot", min_value=0.0, value=1.14165, step=0.0001, format="%.5f")
+    with mcol2:
+        manual_dxy_pct = st.number_input("DXY Degisim %", value=0.75, step=0.01, format="%.2f")
+    with mcol3:
+        manual_vix = st.number_input("VIX", min_value=0.0, value=27.18, step=0.01, format="%.2f")
+    with mcol4:
+        manual_us2y = st.number_input("US 2Y", value=3.729, step=0.001, format="%.3f")
+    with mcol5:
+        manual_us10y = st.number_input("US 10Y", value=4.283, step=0.001, format="%.3f")
+
 top_left, top_mid, top_right = st.columns([2, 2, 3])
 
 with top_left:
@@ -327,7 +343,16 @@ if "data" not in st.session_state:
 
 if refresh:
     with st.spinner("Motor çalışıyor, veriler toplanıyor..."):
-        st.session_state.data = run_engine()
+        manual_inputs = None
+        if manual_mode:
+            manual_inputs = {
+                "spot": manual_spot,
+                "dxy_pct": manual_dxy_pct,
+                "vix": manual_vix,
+                "us2y": manual_us2y,
+                "us10y": manual_us10y,
+            }
+        st.session_state.data = run_engine(manual_inputs=manual_inputs)
 
 if st.session_state.data is None:
     st.info("Önce 'Analizi Güncelle' butonuna bas.")
@@ -380,6 +405,9 @@ if _val_flags:
     with st.expander(f"⚠️ {len(_val_flags)} veri uyarısı tespit edildi", expanded=False):
         for _f in _val_flags:
             st.warning(_f)
+
+if d.get("manual_mode"):
+    st.info("Manuel veri modu aktif: Spot, DXY, VIX, US2Y ve US10Y kullanıcı girdilerinden kullanıldı.")
 
 _dxy_source = d.get("dxy_source")
 if _dxy_source == "PROXY:EURUSD_INVERSE":

@@ -2,9 +2,11 @@ import os
 import re
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -20,11 +22,17 @@ logger = logging.getLogger(__name__)
 CACHE_DIR = Path(os.getenv("SELVESE_CACHE_DIR", "/tmp/selvese-pusula-cache"))
 CACHE_NAMESPACE = os.getenv("SELVESE_CACHE_NAMESPACE", "prod").strip() or "prod"
 CACHE_VERSION = "v1"
+_YF_LOCK = Lock()
 
 # Roadmap Faz 1 TTL kuralları (saniye)
 _TTL_SPOT   = 60      # spot / OHLCV
 _TTL_RATES  = 1800    # faiz oranları (30 dk)
 _TTL_MACRO  = 3600    # makro takvim (1 saat)
+
+_EURUSD_1D_PERIOD = "2y"
+_EURUSD_4H_PERIOD = "45d"
+_EURUSD_1H_PERIOD = "30d"
+_MARKET_1D_PERIOD = "2y"
 
 
 def safe_float(x):
@@ -120,6 +128,38 @@ def _build_inverse_fx_proxy(df, base_level=100.0):
     return _ensure_ohlc(inverse)
 
 
+def _build_flat_ohlc_series(value, periods=365, freq="D"):
+    if value is None:
+        return None
+    idx = pd.date_range(end=datetime.now(timezone.utc), periods=periods, freq=freq)
+    df = pd.DataFrame(
+        {
+            "Open": float(value),
+            "High": float(value),
+            "Low": float(value),
+            "Close": float(value),
+        },
+        index=idx,
+    )
+    return _ensure_ohlc(df)
+
+
+def _apply_manual_spot(df, spot):
+    frame = _ensure_ohlc(df)
+    if frame is None or frame.empty or spot is None:
+        return frame
+
+    last_idx = frame.index[-1]
+    open_val = safe_float(frame.at[last_idx, "Open"])
+    high_val = safe_float(frame.at[last_idx, "High"])
+    low_val = safe_float(frame.at[last_idx, "Low"])
+
+    frame.at[last_idx, "Close"] = float(spot)
+    frame.at[last_idx, "High"] = max(v for v in [open_val, high_val, low_val, float(spot)] if v is not None)
+    frame.at[last_idx, "Low"] = min(v for v in [open_val, high_val, low_val, float(spot)] if v is not None)
+    return frame
+
+
 def _cache_file(cache_key, suffix):
     CACHE_DIR.mkdir(exist_ok=True)
     safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", cache_key)
@@ -206,7 +246,7 @@ def _save_list_cache(cache_key, items):
         logger.warning("list cache yazilamadi key=%s err=%s", cache_key, e)
 
 
-def _http_get(url, params=None, timeout=20):
+def _http_get(url, params=None, timeout=8):
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -217,7 +257,7 @@ def _http_get(url, params=None, timeout=20):
     return requests.get(url, params=params, timeout=timeout, headers=headers)
 
 
-def _http_get_with_retry(url, params=None, timeouts=(10, 20, 30), backoff_seconds=(1.0, 2.0)):
+def _http_get_with_retry(url, params=None, timeouts=(3, 5, 8), backoff_seconds=(0.3, 0.7)):
     last_error = None
     for attempt, timeout in enumerate(timeouts, start=1):
         try:
@@ -326,6 +366,11 @@ def _download_treasury_par_yield_table():
     return None
 
 
+@st.cache_data(ttl=_TTL_RATES, show_spinner=False)
+def get_treasury_par_yield_table():
+    return _download_treasury_par_yield_table()
+
+
 def _download_cboe_vix_history():
     url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
     response = _http_get_with_retry(url)
@@ -360,7 +405,7 @@ def _download_market_fallback(ticker, interval, period):
 
     if ticker == "DX-Y.NYB":
         try:
-            start_date = (datetime.now(LOCAL_TZ).date() - timedelta(days=365 * 3)).isoformat()
+            start_date = (datetime.now(LOCAL_TZ).date() - timedelta(days=365 * 2)).isoformat()
             return _download_fred_close_history("DTWEXBGS", start_date=start_date)
         except (requests.exceptions.RequestException, pd.errors.ParserError, ValueError, KeyError) as e:
             logger.warning("FRED DXY fallback hatasi ticker=%s err=%s", ticker, e)
@@ -396,16 +441,18 @@ def get_yahoo(ticker, interval="1d", period="6mo"):
     cache_key = f"yahoo_{ticker}_{interval}_{period}"
     needed = ["Open", "High", "Low", "Close"]
 
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            df = yf.download(
-                ticker,
-                interval=interval,
-                period=period,
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-            )
+            with _YF_LOCK:
+                df = yf.download(
+                    ticker,
+                    interval=interval,
+                    period=period,
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,
+                    timeout=5,
+                )
 
             if df is None or df.empty:
                 raise ValueError("bos dataframe")
@@ -428,8 +475,8 @@ def get_yahoo(ticker, interval="1d", period="6mo"):
                 "get_yahoo: veri alinamadi ticker=%s interval=%s attempt=%s err=%s",
                 ticker, interval, attempt + 1, e
             )
-            if attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
+            if attempt < 1:
+                time.sleep(0.5)
 
     cached_df, cached_at = _load_dataframe_cache(cache_key)
     if cached_df is not None:
@@ -449,25 +496,23 @@ def get_yahoo(ticker, interval="1d", period="6mo"):
 def get_us2y_with_source():
     fetched_at = stamp("us2y")
     try:
-        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS2"
-        r = _http_get_with_retry(url)
-        if r.status_code == 200 and r.text.strip():
-            df = pd.read_csv(StringIO(r.text))
-            if "DGS2" in df.columns:
-                s = pd.to_numeric(df["DGS2"], errors="coerce").dropna()
-                if not s.empty:
-                    payload = {"value": float(s.iloc[-1]), "source": "FRED:DGS2", "status": "ok", "fetched_at": fetched_at.isoformat()}
-                    _save_dict_cache("us2y", payload)
-                    return {"value": float(s.iloc[-1]), "source": "FRED:DGS2", "status": "ok", "fetched_at": fetched_at}
-    except (requests.exceptions.RequestException, pd.errors.ParserError, ValueError, KeyError) as e:
-        logger.warning("get_us2y FRED: %s", e)
+        table = get_treasury_par_yield_table()
+        if table is not None and not table.empty:
+            series = pd.to_numeric(table["2 Yr"], errors="coerce").dropna()
+            if not series.empty:
+                value = float(series.iloc[-1])
+                payload = {"value": value, "source": "USTREASURY:TEXTVIEW_2YR", "status": "ok", "fetched_at": fetched_at.isoformat()}
+                _save_dict_cache("us2y", payload)
+                return {"value": value, "source": "USTREASURY:TEXTVIEW_2YR", "status": "ok", "fetched_at": fetched_at}
+    except (requests.exceptions.RequestException, ValueError, ImportError) as e:
+        logger.warning("get_us2y Treasury TextView: %s", e)
 
     try:
         url = (
             "https://home.treasury.gov/resource-center/data-chart-center/"
             "interest-rates/pages/xmlview?data=daily_treasury_yield_curve"
         )
-        r = _http_get_with_retry(url)
+        r = _http_get_with_retry(url, timeouts=(2, 4))
         if r.status_code == 200 and r.text:
             matches = re.findall(r"BC_2YEAR[^0-9]*([\d\.]+)", r.text)
             if matches:
@@ -478,16 +523,18 @@ def get_us2y_with_source():
         logger.warning("get_us2y Treasury: %s", e)
 
     try:
-        table = _download_treasury_par_yield_table()
-        if table is not None and not table.empty:
-            series = pd.to_numeric(table["2 Yr"], errors="coerce").dropna()
-            if not series.empty:
-                value = float(series.iloc[-1])
-                payload = {"value": value, "source": "USTREASURY:TEXTVIEW_2YR", "status": "ok", "fetched_at": fetched_at.isoformat()}
-                _save_dict_cache("us2y", payload)
-                return {"value": value, "source": "USTREASURY:TEXTVIEW_2YR", "status": "ok", "fetched_at": fetched_at}
-    except (requests.exceptions.RequestException, ValueError, ImportError) as e:
-        logger.warning("get_us2y Treasury TextView: %s", e)
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS2"
+        r = _http_get_with_retry(url, timeouts=(2, 4))
+        if r.status_code == 200 and r.text.strip():
+            df = pd.read_csv(StringIO(r.text))
+            if "DGS2" in df.columns:
+                s = pd.to_numeric(df["DGS2"], errors="coerce").dropna()
+                if not s.empty:
+                    payload = {"value": float(s.iloc[-1]), "source": "FRED:DGS2", "status": "ok", "fetched_at": fetched_at.isoformat()}
+                    _save_dict_cache("us2y", payload)
+                    return {"value": float(s.iloc[-1]), "source": "FRED:DGS2", "status": "ok", "fetched_at": fetched_at}
+    except (requests.exceptions.RequestException, pd.errors.ParserError, ValueError, KeyError) as e:
+        logger.warning("get_us2y FRED: %s", e)
 
     cached, cached_at = _load_dict_cache("us2y")
     if cached:
@@ -506,25 +553,23 @@ def get_us2y_with_source():
 def get_us10y_with_source():
     fetched_at = stamp("us10y")
     try:
-        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
-        r = _http_get_with_retry(url)
-        if r.status_code == 200 and r.text.strip():
-            df = pd.read_csv(StringIO(r.text))
-            if "DGS10" in df.columns:
-                s = pd.to_numeric(df["DGS10"], errors="coerce").dropna()
-                if not s.empty:
-                    payload = {"value": float(s.iloc[-1]), "source": "FRED:DGS10", "status": "ok", "fetched_at": fetched_at.isoformat()}
-                    _save_dict_cache("us10y", payload)
-                    return {"value": float(s.iloc[-1]), "source": "FRED:DGS10", "status": "ok", "fetched_at": fetched_at}
-    except (requests.exceptions.RequestException, pd.errors.ParserError, ValueError, KeyError) as e:
-        logger.warning("get_us10y FRED: %s", e)
+        table = get_treasury_par_yield_table()
+        if table is not None and not table.empty:
+            series = pd.to_numeric(table["10 Yr"], errors="coerce").dropna()
+            if not series.empty:
+                value = float(series.iloc[-1])
+                payload = {"value": value, "source": "USTREASURY:TEXTVIEW_10YR", "status": "ok", "fetched_at": fetched_at.isoformat()}
+                _save_dict_cache("us10y", payload)
+                return {"value": value, "source": "USTREASURY:TEXTVIEW_10YR", "status": "ok", "fetched_at": fetched_at}
+    except (requests.exceptions.RequestException, ValueError, ImportError) as e:
+        logger.warning("get_us10y Treasury TextView: %s", e)
 
     try:
         url = (
             "https://home.treasury.gov/resource-center/data-chart-center/"
             "interest-rates/pages/xmlview?data=daily_treasury_yield_curve"
         )
-        r = _http_get_with_retry(url)
+        r = _http_get_with_retry(url, timeouts=(2, 4))
         if r.status_code == 200 and r.text:
             matches = re.findall(r"BC_10YEAR[^0-9]*([\d\.]+)", r.text)
             if matches:
@@ -535,16 +580,18 @@ def get_us10y_with_source():
         logger.warning("get_us10y Treasury: %s", e)
 
     try:
-        table = _download_treasury_par_yield_table()
-        if table is not None and not table.empty:
-            series = pd.to_numeric(table["10 Yr"], errors="coerce").dropna()
-            if not series.empty:
-                value = float(series.iloc[-1])
-                payload = {"value": value, "source": "USTREASURY:TEXTVIEW_10YR", "status": "ok", "fetched_at": fetched_at.isoformat()}
-                _save_dict_cache("us10y", payload)
-                return {"value": value, "source": "USTREASURY:TEXTVIEW_10YR", "status": "ok", "fetched_at": fetched_at}
-    except (requests.exceptions.RequestException, ValueError, ImportError) as e:
-        logger.warning("get_us10y Treasury TextView: %s", e)
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
+        r = _http_get_with_retry(url, timeouts=(2, 4))
+        if r.status_code == 200 and r.text.strip():
+            df = pd.read_csv(StringIO(r.text))
+            if "DGS10" in df.columns:
+                s = pd.to_numeric(df["DGS10"], errors="coerce").dropna()
+                if not s.empty:
+                    payload = {"value": float(s.iloc[-1]), "source": "FRED:DGS10", "status": "ok", "fetched_at": fetched_at.isoformat()}
+                    _save_dict_cache("us10y", payload)
+                    return {"value": float(s.iloc[-1]), "source": "FRED:DGS10", "status": "ok", "fetched_at": fetched_at}
+    except (requests.exceptions.RequestException, pd.errors.ParserError, ValueError, KeyError) as e:
+        logger.warning("get_us10y FRED: %s", e)
 
     cached, cached_at = _load_dict_cache("us10y")
     if cached:
@@ -777,18 +824,51 @@ def build_data_quality(checks: dict):
 
 
 @st.cache_data(ttl=_TTL_SPOT, show_spinner=False)
-def get_market_bundle():
-    eur_1d, ts_eur_1d = get_yahoo("EURUSD=X", "1d", "10y")
-    eur_4h, ts_eur_4h = get_yahoo("EURUSD=X", "4h", "180d")
+def get_market_bundle(manual_inputs=None):
+    manual_inputs = manual_inputs or {}
+    manual_mode = bool(manual_inputs)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            "eur_1d": executor.submit(get_yahoo, "EURUSD=X", "1d", _EURUSD_1D_PERIOD),
+            "eur_4h": executor.submit(get_yahoo, "EURUSD=X", "4h", _EURUSD_4H_PERIOD),
+            "de2y": executor.submit(get_de2y_with_source),
+            "de10y": executor.submit(get_de10y_with_source),
+            "macro": executor.submit(get_macro_events_with_source),
+        }
+
+        if manual_inputs.get("dxy_pct") is None:
+            futures["dxy"] = executor.submit(get_yahoo, "DX-Y.NYB", "1d", _MARKET_1D_PERIOD)
+        if manual_inputs.get("vix") is None:
+            futures["vix"] = executor.submit(get_yahoo, "^VIX", "1d", _MARKET_1D_PERIOD)
+        if manual_inputs.get("us2y") is None:
+            futures["us2y"] = executor.submit(get_us2y_with_source)
+        if manual_inputs.get("us10y") is None:
+            futures["us10y"] = executor.submit(get_us10y_with_source)
+
+        eur_1d, ts_eur_1d = futures["eur_1d"].result()
+        eur_4h, ts_eur_4h = futures["eur_4h"].result()
+        de2y_info = futures["de2y"].result()
+        de10y_info = futures["de10y"].result()
+        macro_info = futures["macro"].result()
+
     if eur_4h is None or eur_4h.empty:
-        eur_1h, ts_eur_1h = get_yahoo("EURUSD=X", "1h", "60d")
+        eur_1h, ts_eur_1h = get_yahoo("EURUSD=X", "1h", _EURUSD_1H_PERIOD)
         eur_4h_from_1h = _resample_to_4h(eur_1h)
         if eur_4h_from_1h is not None and not eur_4h_from_1h.empty:
             logger.warning("get_market_bundle: EURUSD 4H verisi 1H veriden uretildi")
             eur_4h = eur_4h_from_1h
             ts_eur_4h = ts_eur_1h
-    dxy_df, ts_dxy    = get_yahoo("DX-Y.NYB", "1d", "10y")
-    vix_df, ts_vix    = get_yahoo("^VIX", "1d", "10y")
+
+    dxy_df = None
+    ts_dxy = stamp("manual_dxy" if manual_inputs.get("dxy_pct") is not None else "dxy_df")
+    if manual_inputs.get("dxy_pct") is None:
+        dxy_df, ts_dxy = futures["dxy"].result()
+
+    vix_df = None
+    ts_vix = stamp("manual_vix" if manual_inputs.get("vix") is not None else "vix_df")
+    if manual_inputs.get("vix") is None:
+        vix_df, ts_vix = futures["vix"].result()
 
     dxy_source_override = None
     if dxy_df is None or dxy_df.empty:
@@ -797,15 +877,26 @@ def get_market_bundle():
             logger.warning("get_market_bundle: DXY verisi EURUSD ters proxy ile uretildi")
             dxy_df = dxy_proxy
             ts_dxy = ts_eur_1d
-            dxy_source_override = "PROXY:EURUSD_INVERSE"
+            dxy_source_override = "PROXY:EURUSD_INVERSE" if manual_inputs.get("dxy_pct") is None else "MANUAL:DXY_PCT+PROXY_HISTORY"
 
-    us2y_info  = get_us2y_with_source()
-    us10y_info = get_us10y_with_source()
-    de2y_info  = get_de2y_with_source()
-    de10y_info = get_de10y_with_source()
-    macro_info = get_macro_events_with_source()
+    us2y_info  = (
+        {"value": safe_float(manual_inputs.get("us2y")), "source": "MANUAL:US2Y", "status": "manual", "fetched_at": stamp("manual_us2y")}
+        if manual_inputs.get("us2y") is not None
+        else futures["us2y"].result()
+    )
+    us10y_info = (
+        {"value": safe_float(manual_inputs.get("us10y")), "source": "MANUAL:US10Y", "status": "manual", "fetched_at": stamp("manual_us10y")}
+        if manual_inputs.get("us10y") is not None
+        else futures["us10y"].result()
+    )
 
-    spot = safe_float(eur_1d["Close"].iloc[-1]) if eur_1d is not None and not eur_1d.empty else None
+    if manual_inputs.get("spot") is not None:
+        eur_1d = _apply_manual_spot(eur_1d, manual_inputs.get("spot"))
+        eur_4h = _apply_manual_spot(eur_4h, manual_inputs.get("spot"))
+
+    spot = safe_float(manual_inputs.get("spot")) if manual_inputs.get("spot") is not None else (
+        safe_float(eur_1d["Close"].iloc[-1]) if eur_1d is not None and not eur_1d.empty else None
+    )
 
     support = None
     resistance = None
@@ -822,14 +913,21 @@ def get_market_bundle():
         dxy_start = safe_float(dxy_df["Close"].iloc[-4])
         dxy_end   = safe_float(dxy_df["Close"].iloc[-1])
         dxy_pct = pct(dxy_start, dxy_end)
+    if manual_inputs.get("dxy_pct") is not None:
+        dxy_pct = safe_float(manual_inputs.get("dxy_pct"))
 
-    vix_val = safe_float(vix_df["Close"].iloc[-1]) if vix_df is not None and not vix_df.empty else None
+    if manual_inputs.get("vix") is not None:
+        vix_val = safe_float(manual_inputs.get("vix"))
+        if vix_df is None or vix_df.empty:
+            vix_df = _build_flat_ohlc_series(vix_val)
+    else:
+        vix_val = safe_float(vix_df["Close"].iloc[-1]) if vix_df is not None and not vix_df.empty else None
 
     checks = {
         "EURUSD_1D": eur_1d is not None and not eur_1d.empty,
         "EURUSD_4H": eur_4h is not None and not eur_4h.empty,
-        "DXY":       dxy_df is not None and not dxy_df.empty,
-        "VIX":       vix_df is not None and not vix_df.empty,
+        "DXY":       (manual_inputs.get("dxy_pct") is not None) or (dxy_df is not None and not dxy_df.empty),
+        "VIX":       (manual_inputs.get("vix") is not None) or (vix_df is not None and not vix_df.empty),
         "US2Y":      us2y_info["value"]  is not None,
         "US10Y":     us10y_info["value"] is not None,
         "DE2Y":      de2y_info["value"]  is not None,
@@ -868,6 +966,7 @@ def get_market_bundle():
         "de2y_source":  de2y_info["source"],
         "de10y_source": de10y_info["source"],
         "dxy_source":   dxy_source_override or "YAHOO_OR_FRED",
+        "manual_mode":  manual_mode,
         "macro_events": macro_info["events"],
         "macro_source": macro_info["source"],
         "macro_status": macro_info["status"],
