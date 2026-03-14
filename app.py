@@ -359,13 +359,16 @@ def render_score_block(name, value, comment):
 
 
 def render_horizon_summary(view):
+    business = view.get("business", {})
     st.markdown(
         f"""
         <div class="plan-box">
             <div class="plan-title">{view['label']} • {view['window']}</div>
             <div class="plan-main">{view['emoji']} {view['karar']}</div>
             <div class="plan-text">EDE: <b>{view['ede']}</b> | Plan: <b>{view['sale_plan']['daily_units']}/100</b></div>
-            <div class="info-box">{view['summary']}</div>
+            <div class="info-box"><b>Önerilen aksiyon</b><br>{business.get('action', view['summary'])}</div>
+            <div class="info-box"><b>Neden şimdi</b><br>{business.get('why_now', view['summary'])}</div>
+            <div class="risk-box"><b>Temel risk</b><br>{business.get('risk', 'Piyasa koşulları hızla değişebilir.')}</div>
         </div>
         """,
         unsafe_allow_html=True,

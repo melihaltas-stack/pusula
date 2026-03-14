@@ -194,6 +194,41 @@ def build_operation_summary(d):
     )
 
 
+def build_horizon_business_summary(horizon, view, trend_regime, confidence_label):
+    units = view["sale_plan"]["daily_units"]
+    if horizon == "short_term":
+        if units >= 50:
+            action = "yakın günlerde kademeli satışa başla"
+        elif units >= 30:
+            action = "sınırlı satışla pozisyon azalt"
+        else:
+            action = "acele etme, teyit bekle"
+        risk = "ani tepki yükselişi" if trend_regime == "DOWN" else "düşüşün hız kesmesi"
+    elif horizon == "medium_term":
+        if units >= 50:
+            action = "önümüzdeki haftalara yayılmış satış planını hızlandır"
+        elif units >= 30:
+            action = "planı hazır tut, güçlü günlerde kademeli uygula"
+        else:
+            action = "pozisyonu koru, daha iyi pencere bekle"
+        risk = "makro veri akışı ve faiz farkı değişimi"
+    else:
+        if units >= 50:
+            action = "uzun vadeli hedge oranını artır"
+        elif units >= 30:
+            action = "minimum korumayı koru, esnek kal"
+        else:
+            action = "uzun vade için agresifleşme"
+        risk = "trendin orta vadede tersine dönmesi"
+
+    confidence_text = f"veri güveni {confidence_label.lower()}"
+    return {
+        "action": action,
+        "why_now": f"{view['summary']} Bu görünümde {confidence_text}.",
+        "risk": risk,
+    }
+
+
 def build_horizon_view(horizon, scores, dxy_source, trend_regime, macro_score):
     meta = HORIZON_META[horizon]
     ede = calculate_ede(scores, horizon=horizon, dxy_source=dxy_source, trend_regime=trend_regime)
@@ -253,6 +288,10 @@ def run_engine(manual_inputs=None):
 
     scores, comments = build_scores(bundle)
     trend_regime = detect_trend_regime(eur_1d)
+    data_quality = bundle.get("data_quality", {})
+    data_quality_score = data_quality.get("score", 0)
+    confidence_label = classify_confidence(data_quality_score)
+
     horizon_views = {
         key: build_horizon_view(
             key,
@@ -263,6 +302,8 @@ def run_engine(manual_inputs=None):
         )
         for key in ["short_term", "medium_term", "long_term"]
     }
+    for key, view in horizon_views.items():
+        view["business"] = build_horizon_business_summary(key, view, trend_regime, confidence_label)
     primary_horizon = horizon_views["short_term"]
     ede = primary_horizon["ede"]
     decision = {
@@ -270,10 +311,6 @@ def run_engine(manual_inputs=None):
         "renk": primary_horizon["renk"],
         "emoji": primary_horizon["emoji"],
     }
-
-    data_quality = bundle.get("data_quality", {})
-    data_quality_score = data_quality.get("score", 0)
-    confidence_label = classify_confidence(data_quality_score)
 
     sale_plan = primary_horizon["sale_plan"]
 
