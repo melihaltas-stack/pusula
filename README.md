@@ -59,3 +59,28 @@ python3 tests/smoke_check.py
 Notlar:
 - `DXY` canlı veri gelmezse sistem `PROXY:EURUSD_INVERSE` kaynağına düşebilir.
 - `EUR/USD 4H` veri gelmezse `1H -> 4H` birleştirme kullanılır.
+- `TWELVEDATA_API_KEY` tanımlanırsa sistem `EUR/USD`, `DXY`, `VIX`, `US2Y`, `US10Y`
+  verilerinde önce Twelve Data'yı dener; başarısız olursa mevcut fallback zincirine düşer.
+
+## Önerilen Otomatik Veri Omurgası
+
+Bu proje için en mantıklı yapı:
+
+1. Birincil kaynak: `Twelve Data`
+2. İkincil kaynaklar: `ECB`, `US Treasury`, `FRED`, `CBOE`
+3. Operasyonel emniyet: uygulama içi `Hızlı Mod` / manuel override
+
+Opsiyonel ortam değişkenleri:
+
+```bash
+TWELVEDATA_API_KEY=...
+TWELVEDATA_EURUSD_SYMBOL=EUR/USD
+TWELVEDATA_DXY_SYMBOL=DXY
+TWELVEDATA_VIX_SYMBOL=VIX
+TWELVEDATA_US2Y_SYMBOL=US2Y
+TWELVEDATA_US10Y_SYMBOL=US10Y
+```
+
+Not:
+- Sembol adları veri planına göre değişebilir. Gerekirse bu ortam değişkenleriyle
+  sembolleri değiştirebilirsin.

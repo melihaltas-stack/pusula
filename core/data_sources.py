@@ -425,6 +425,101 @@ def _download_market_fallback(ticker, interval, period):
     return None
 
 
+def get_twelvedata_api_key():
+    try:
+        key = st.secrets.get("TWELVEDATA_API_KEY", "")
+        if key:
+            return key
+    except Exception:
+        pass
+    return os.getenv("TWELVEDATA_API_KEY", "")
+
+
+def _twelvedata_symbol(env_key, default):
+    return (os.getenv(env_key, default) or default).strip()
+
+
+def _twelvedata_interval(interval):
+    mapping = {
+        "1d": "1day",
+        "4h": "4h",
+        "1h": "1h",
+    }
+    return mapping.get(interval, interval)
+
+
+def _twelvedata_outputsize(interval, period):
+    if interval == "1d":
+        return 500 if period in {"2y", "10y"} else 252
+    if interval == "4h":
+        return 400
+    if interval == "1h":
+        return 500
+    return 200
+
+
+def _download_twelvedata_time_series(symbol, interval="1d", period="6mo"):
+    api_key = get_twelvedata_api_key()
+    if not api_key:
+        return None
+
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": _twelvedata_interval(interval),
+        "outputsize": _twelvedata_outputsize(interval, period),
+        "apikey": api_key,
+        "timezone": "UTC",
+        "order": "ASC",
+        "format": "JSON",
+    }
+    response = _http_get_with_retry(url, params=params, timeouts=(3, 5, 8))
+    data = response.json()
+    values = data.get("values") if isinstance(data, dict) else None
+    if not values:
+        message = data.get("message") if isinstance(data, dict) else "bos response"
+        raise ValueError(f"TwelveData time_series bos: {message}")
+
+    df = pd.DataFrame(values)
+    dt_col = "datetime" if "datetime" in df.columns else "date"
+    if dt_col not in df.columns:
+        raise KeyError("datetime kolon yok")
+
+    normalized = pd.DataFrame(
+        {
+            "Open": pd.to_numeric(df.get("open"), errors="coerce"),
+            "High": pd.to_numeric(df.get("high"), errors="coerce"),
+            "Low": pd.to_numeric(df.get("low"), errors="coerce"),
+            "Close": pd.to_numeric(df.get("close"), errors="coerce"),
+        },
+        index=pd.to_datetime(df[dt_col], errors="coerce", utc=True),
+    ).dropna()
+    return _ensure_ohlc(normalized)
+
+
+def _download_twelvedata_quote_value(symbol):
+    api_key = get_twelvedata_api_key()
+    if not api_key:
+        return None
+
+    url = "https://api.twelvedata.com/quote"
+    response = _http_get_with_retry(
+        url,
+        params={"symbol": symbol, "apikey": api_key, "format": "JSON"},
+        timeouts=(3, 5, 8),
+    )
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError("TwelveData quote response dict degil")
+
+    for key in ("close", "price", "previous_close"):
+        value = safe_float(data.get(key))
+        if value is not None:
+            return value
+
+    raise ValueError(f"TwelveData quote bos: {data.get('message', 'unknown')}")
+
+
 def get_fmp_api_key():
     try:
         key = st.secrets.get("FMP_API_KEY", "")
@@ -440,6 +535,24 @@ def get_yahoo(ticker, interval="1d", period="6mo"):
     fetched_at = stamp(ticker)
     cache_key = f"yahoo_{ticker}_{interval}_{period}"
     needed = ["Open", "High", "Low", "Close"]
+    tw_symbol_map = {
+        "EURUSD=X": _twelvedata_symbol("TWELVEDATA_EURUSD_SYMBOL", "EUR/USD"),
+        "DX-Y.NYB": _twelvedata_symbol("TWELVEDATA_DXY_SYMBOL", "DXY"),
+        "^VIX": _twelvedata_symbol("TWELVEDATA_VIX_SYMBOL", "VIX"),
+    }
+
+    tw_symbol = tw_symbol_map.get(ticker)
+    if tw_symbol and get_twelvedata_api_key():
+        try:
+            df = _download_twelvedata_time_series(tw_symbol, interval=interval, period=period)
+            if df is not None and not df.empty:
+                _save_dataframe_cache(cache_key, df)
+                return df, fetched_at
+        except (requests.exceptions.RequestException, ValueError, KeyError) as e:
+            logger.warning(
+                "get_yahoo: TwelveData veri alinamadi ticker=%s symbol=%s interval=%s err=%s",
+                ticker, tw_symbol, interval, e
+            )
 
     for attempt in range(2):
         try:
@@ -495,6 +608,17 @@ def get_yahoo(ticker, interval="1d", period="6mo"):
 @st.cache_data(ttl=_TTL_RATES, show_spinner=False)
 def get_us2y_with_source():
     fetched_at = stamp("us2y")
+    tw_symbol = _twelvedata_symbol("TWELVEDATA_US2Y_SYMBOL", "US2Y")
+    if get_twelvedata_api_key():
+        try:
+            value = _download_twelvedata_quote_value(tw_symbol)
+            if value is not None:
+                payload = {"value": value, "source": f"TWELVEDATA:{tw_symbol}", "status": "ok", "fetched_at": fetched_at.isoformat()}
+                _save_dict_cache("us2y", payload)
+                return {"value": value, "source": f"TWELVEDATA:{tw_symbol}", "status": "ok", "fetched_at": fetched_at}
+        except (requests.exceptions.RequestException, ValueError, KeyError) as e:
+            logger.warning("get_us2y TwelveData: %s", e)
+
     try:
         table = get_treasury_par_yield_table()
         if table is not None and not table.empty:
@@ -552,6 +676,17 @@ def get_us2y_with_source():
 @st.cache_data(ttl=_TTL_RATES, show_spinner=False)
 def get_us10y_with_source():
     fetched_at = stamp("us10y")
+    tw_symbol = _twelvedata_symbol("TWELVEDATA_US10Y_SYMBOL", "US10Y")
+    if get_twelvedata_api_key():
+        try:
+            value = _download_twelvedata_quote_value(tw_symbol)
+            if value is not None:
+                payload = {"value": value, "source": f"TWELVEDATA:{tw_symbol}", "status": "ok", "fetched_at": fetched_at.isoformat()}
+                _save_dict_cache("us10y", payload)
+                return {"value": value, "source": f"TWELVEDATA:{tw_symbol}", "status": "ok", "fetched_at": fetched_at}
+        except (requests.exceptions.RequestException, ValueError, KeyError) as e:
+            logger.warning("get_us10y TwelveData: %s", e)
+
     try:
         table = get_treasury_par_yield_table()
         if table is not None and not table.empty:

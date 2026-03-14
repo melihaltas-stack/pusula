@@ -222,6 +222,22 @@ def fmt_num(value, digits=2, suffix=""):
     return f"{value:.{digits}f}{suffix}"
 
 
+def pretty_source_key(key):
+    labels = {
+        "eur_1d": "EUR/USD 1D",
+        "eur_4h": "EUR/USD 4H",
+        "dxy_df": "DXY",
+        "vix_df": "VIX",
+        "us2y": "US 2Y",
+        "us10y": "US 10Y",
+        "de2y": "DE 2Y",
+        "de10y": "DE 10Y",
+        "macro_events": "Makro Takvim",
+        "spot": "Spot",
+    }
+    return labels.get(key, key)
+
+
 def confidence_badge(label):
     if label == "Yüksek":
         return '<span class="mini-badge badge-high">Veri Güveni: Yüksek</span>'
@@ -388,23 +404,43 @@ if _freshness:
     _fw = _freshness.worst_label
     _color_map = {"fresh": "#00c389", "warning": "#f59e0b", "stale": "#ef4444", "unknown": "#64748b"}
     _fc = _color_map.get(_fw, "#64748b")
+    _stale_labels = [pretty_source_key(k) for k in _freshness.stale_keys()]
+    _warning_labels = [pretty_source_key(k) for k in _freshness.warning_keys()]
     st.markdown(
         f'<div style="background:{_fc}18;border:1px solid {_fc}44;border-radius:10px;'
         f'padding:10px 14px;margin-bottom:10px;font-size:13px;color:{_fc};">'
-        f'<b>Veri Tazeliği</b> &nbsp;|&nbsp; {_freshness.summary_text}'
+        f'<b>Veri Tazeliği</b> &nbsp;|&nbsp; {_freshness.summary_text} &nbsp;|&nbsp; Skor: {_freshness.score:.0f}/100'
         f'</div>',
         unsafe_allow_html=True
     )
     if _fw == "stale":
+        stale_text = ", ".join(_stale_labels) if _stale_labels else "bilinmiyor"
+        st.markdown(
+            '<div style="background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.35);'
+            'border-radius:12px;padding:12px 14px;margin-bottom:10px;color:#fecaca;">'
+            f'<b>Canlı veri bayat</b> &nbsp;|&nbsp; Şu kaynaklar eski cache ile çalışıyor: {stale_text}. '
+            'Anlık karar için Hızlı Mod açık kalsın ve manuel 5 veri girilsin.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
         with st.expander("🔴 Bayat veri detayı", expanded=True):
             for k in _freshness.stale_keys():
                 s = _freshness.statuses[k]
-                st.error(f"{s.badge_emoji} **{k}** — {s.age_text} önce çekildi (limit: {s.ttl_stale}sn)")
+                st.error(f"{s.badge_emoji} **{pretty_source_key(k)}** — {s.age_text} önce çekildi (limit: {s.ttl_stale}sn)")
     elif _fw == "warning":
+        warning_text = ", ".join(_warning_labels) if _warning_labels else "bilinmiyor"
+        st.markdown(
+            '<div style="background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.35);'
+            'border-radius:12px;padding:12px 14px;margin-bottom:10px;color:#fde68a;">'
+            f'<b>Tazelik uyarısı</b> &nbsp;|&nbsp; Şu kaynaklar sınırda: {warning_text}. '
+            'Kararı canlı veri gibi okumadan önce kaynakları kontrol et.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
         with st.expander("🟡 Tazelik uyarıları"):
             for k in _freshness.warning_keys():
                 s = _freshness.statuses[k]
-                st.warning(f"{s.badge_emoji} **{k}** — {s.age_text} önce çekildi")
+                st.warning(f"{s.badge_emoji} **{pretty_source_key(k)}** — {s.age_text} önce çekildi")
 
 # --- Validation uyarıları ---
 _val_flags = d.get("validation_flags", [])
