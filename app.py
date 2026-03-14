@@ -528,6 +528,16 @@ treasury_metrics = build_treasury_metrics(log_df)
 
 horizon_views = d.get("horizon_views", {})
 if horizon_views:
+    st.markdown(
+        '<div style="background:rgba(15,23,42,0.85);border:1px solid rgba(148,163,184,0.25);'
+        'border-radius:12px;padding:12px 14px;margin-bottom:12px;color:#dbe4f0;">'
+        '<b>Ekran Nasıl Okunur?</b><br>'
+        'Kısa vade günlük operasyon kararını verir. Orta vade planı yaymak için kullanılır. '
+        'Uzun vade ise hedge / genel korunma tonunu gösterir. '
+        'Sekmelerde önce <b>Önerilen aksiyon</b>, sonra <b>Neden şimdi</b>, en sonda <b>Temel risk</b> okunmalı.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
     st.markdown("## Vade Görünümü")
     tab_short, tab_medium, tab_long = st.tabs([
         "Kısa Vade 1-5 gün",
