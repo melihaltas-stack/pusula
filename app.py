@@ -313,6 +313,13 @@ def render_score_block(name, value, comment):
 
 st.title("🧭 Selvese EUR Satış Pusulası")
 st.caption("Kurumsal EUR satış yönetimi için açıklanabilir operasyon paneli")
+st.markdown(
+    '<div style="background:rgba(96,165,250,0.12);border:1px solid rgba(96,165,250,0.30);'
+    'border-radius:12px;padding:12px 14px;margin:8px 0 14px 0;color:#dbeafe;">'
+    '<b>Hızlı Kullanım Önerisi</b> &nbsp;|&nbsp; En hızlı sonuç için Hızlı Mod açık kalsın ve üstteki 5 veriyi manuel girin.'
+    '</div>',
+    unsafe_allow_html=True,
+)
 
 with st.expander("⚡ Hizli Mod (Manuel Veri)", expanded=True):
     manual_mode = st.toggle("Hizli modu kullan", value=True)
