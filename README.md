@@ -26,6 +26,12 @@ selvese/
 └── tests/                 # Smoke test
 ```
 
+## Yol Haritası
+
+Kurumsal FX desk yaklaşımına yakınlaşmak için hazırlanmış uygulama roadmap'i:
+
+- `INSTITUTIONAL_FX_ROADMAP.md`
+
 ## Katman Kuralları
 
 | Katman   | UI Import? | Engine Import? | Dış API? |

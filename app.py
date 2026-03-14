@@ -1,11 +1,102 @@
 import streamlit as st
 import plotly.graph_objects as go
+import threading
+import time
+import pickle
+from pathlib import Path
 
 from logging_config import setup_logging
 setup_logging()
 
 from engine import run_engine, build_report_text
 from logger import log_daily_decision, read_decision_log, build_treasury_metrics
+
+
+_DETAIL_LOCK = threading.Lock()
+_DETAIL_TASKS = {}
+_DETAIL_CACHE_FILE = Path("/tmp/selvese-pusula-detail-report.pkl")
+
+
+def _make_detail_task_key(manual_inputs=None):
+    manual_inputs = manual_inputs or {}
+    normalized = tuple(sorted((str(k), float(v) if v is not None else None) for k, v in manual_inputs.items()))
+    return f"{int(time.time() * 1000)}::{normalized}"
+
+
+def _run_detail_task(task_key, manual_inputs=None):
+    try:
+        result = run_engine(
+            manual_inputs=manual_inputs,
+            include_extended_data=True,
+            include_performance_report=True,
+        )
+        save_detail_report_cache(result)
+        with _DETAIL_LOCK:
+            _DETAIL_TASKS[task_key] = {"status": "ready", "result": result, "error": None}
+    except Exception as exc:
+        with _DETAIL_LOCK:
+            _DETAIL_TASKS[task_key] = {"status": "error", "result": None, "error": str(exc)}
+
+
+def start_background_detail_report(manual_inputs=None):
+    task_key = _make_detail_task_key(manual_inputs=manual_inputs)
+    with _DETAIL_LOCK:
+        _DETAIL_TASKS[task_key] = {"status": "running", "result": None, "error": None}
+    worker = threading.Thread(target=_run_detail_task, args=(task_key, manual_inputs), daemon=True)
+    worker.start()
+    st.session_state.detail_task_key = task_key
+    st.session_state.detail_task_mode = "background"
+
+
+def get_background_detail_status():
+    task_key = st.session_state.get("detail_task_key")
+    if not task_key:
+        return None
+    with _DETAIL_LOCK:
+        return _DETAIL_TASKS.get(task_key)
+
+
+def format_age_text(age_seconds):
+    if age_seconds is None:
+        return "bilinmiyor"
+    total_minutes = int(round(age_seconds / 60))
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    if hours <= 0:
+        return f"{minutes} dk"
+    if minutes == 0:
+        return f"{hours} sa"
+    return f"{hours} sa {minutes} dk"
+
+
+def save_detail_report_cache(result):
+    if not isinstance(result, dict) or result.get("error"):
+        return
+    payload = {
+        "saved_at": time.time(),
+        "result": result,
+    }
+    with _DETAIL_CACHE_FILE.open("wb") as fh:
+        pickle.dump(payload, fh)
+
+
+def load_detail_report_cache():
+    if not _DETAIL_CACHE_FILE.exists():
+        return None
+    try:
+        with _DETAIL_CACHE_FILE.open("rb") as fh:
+            payload = pickle.load(fh)
+        if not isinstance(payload, dict):
+            return None
+        result = payload.get("result")
+        if not isinstance(result, dict) or result.get("error"):
+            return None
+        saved_at = payload.get("saved_at")
+        age_seconds = max(0.0, time.time() - float(saved_at)) if saved_at is not None else None
+        payload["age_seconds"] = age_seconds
+        return payload
+    except (OSError, pickle.PickleError, EOFError, AttributeError, ValueError):
+        return None
 
 
 st.set_page_config(
@@ -359,15 +450,19 @@ def render_score_block(name, value, comment):
 
 
 def render_horizon_summary(view):
+    forecast_overlay = view.get("forecast_overlay", {})
+    forecast_delta = forecast_overlay.get("delta", 0.0)
+    forecast_sign = "+" if forecast_delta > 0 else ""
     business = view.get("business", {})
     st.markdown(
         f"""
         <div class="plan-box">
             <div class="plan-title">{view['label']} • {view['window']}</div>
             <div class="plan-main">{view['emoji']} {view['karar']}</div>
-            <div class="plan-text">EDE: <b>{view['ede']}</b> | Plan: <b>{view['sale_plan']['daily_units']}/100</b></div>
+            <div class="plan-text">Hibrit EDE: <b>{view['ede']}</b> | Baz EDE: <b>{view.get('base_ede', view['ede'])}</b> | Forecast etkisi: <b>{forecast_sign}{forecast_delta}</b> | Plan: <b>{view['sale_plan']['daily_units']}/100</b></div>
             <div class="info-box"><b>Önerilen aksiyon</b><br>{business.get('action', view['summary'])}</div>
             <div class="info-box"><b>Neden şimdi</b><br>{business.get('why_now', view['summary'])}</div>
+            <div class="info-box"><b>İstatistiksel destek</b><br>{forecast_overlay.get('summary', 'İstatistiksel tahmin yok.')}</div>
             <div class="risk-box"><b>Temel risk</b><br>{business.get('risk', 'Piyasa koşulları hızla değişebilir.')}</div>
         </div>
         """,
@@ -377,6 +472,14 @@ def render_horizon_summary(view):
 
 st.title("🧭 Selvese EUR Satış Pusulası")
 st.caption("Kurumsal EUR satış yönetimi için açıklanabilir operasyon paneli")
+st.markdown(
+    '<div style="background:rgba(239,68,68,0.10);border:1px solid rgba(239,68,68,0.30);'
+    'border-radius:12px;padding:12px 14px;margin:8px 0 14px 0;color:#fecaca;">'
+    '<b>Uyarı</b> &nbsp;|&nbsp; Bu uygulama Selvese Yatırım A.Ş. ve iştiraklerinin kullanımı için özel olarak hazırlanmıştır. '
+    'Yatırım tavsiyesi içermez.'
+    '</div>',
+    unsafe_allow_html=True,
+)
 st.markdown(
     '<div style="background:rgba(96,165,250,0.12);border:1px solid rgba(96,165,250,0.30);'
     'border-radius:12px;padding:12px 14px;margin:8px 0 14px 0;color:#dbeafe;">'
@@ -393,15 +496,46 @@ with top_left:
 with top_mid:
     save_log = st.button("💾 Bugünkü Kararı Logla")
 
+with top_right:
+    detailed_mode = st.checkbox("Detaylı mod", value=False, help="Açık veriyle ek factor'lar ve performans raporunu da hesaplar. Daha yavaştır.")
+
 if "data" not in st.session_state:
     st.session_state.data = None
 if "manual_requirements" not in st.session_state:
     st.session_state.manual_requirements = []
+if "detail_task_key" not in st.session_state:
+    st.session_state.detail_task_key = None
+if "detail_task_mode" not in st.session_state:
+    st.session_state.detail_task_mode = None
+if "loaded_from_detail_cache" not in st.session_state:
+    st.session_state.loaded_from_detail_cache = False
+if "detail_cache_age_seconds" not in st.session_state:
+    st.session_state.detail_cache_age_seconds = None
+
+if st.session_state.data is None:
+    cached_detail = load_detail_report_cache()
+    if cached_detail:
+        st.session_state.data = cached_detail["result"]
+        st.session_state.manual_requirements = build_manual_requirements(st.session_state.data)
+        st.session_state.detail_task_mode = "cached"
+        st.session_state.loaded_from_detail_cache = True
+        st.session_state.detail_cache_age_seconds = cached_detail.get("age_seconds")
 
 if refresh:
     with st.spinner("Motor çalışıyor, veriler toplanıyor..."):
-        st.session_state.data = run_engine()
+        st.session_state.data = run_engine(
+            include_extended_data=detailed_mode,
+            include_performance_report=detailed_mode,
+        )
         st.session_state.manual_requirements = build_manual_requirements(st.session_state.data)
+        if detailed_mode:
+            st.session_state.detail_task_key = None
+            st.session_state.detail_task_mode = "sync"
+            save_detail_report_cache(st.session_state.data)
+        else:
+            start_background_detail_report()
+        st.session_state.loaded_from_detail_cache = False
+        st.session_state.detail_cache_age_seconds = None
 
 if st.session_state.data is None:
     st.info("Önce 'Otomatik Analizi Çalıştır' butonuna bas.")
@@ -447,16 +581,81 @@ if manual_requirements:
                 manual_inputs[item["key"]] = st.number_input(**kwargs)
         if st.button("⚡ Eksik Verilerle Analizi Tamamla"):
             with st.spinner("Eksik verilerle analiz tamamlanıyor..."):
-                st.session_state.data = run_engine(manual_inputs=manual_inputs)
+                st.session_state.data = run_engine(
+                    manual_inputs=manual_inputs,
+                    include_extended_data=detailed_mode,
+                    include_performance_report=detailed_mode,
+                )
                 st.session_state.manual_requirements = build_manual_requirements(st.session_state.data)
+                if detailed_mode:
+                    st.session_state.detail_task_key = None
+                    st.session_state.detail_task_mode = "sync"
+                    save_detail_report_cache(st.session_state.data)
+                else:
+                    start_background_detail_report(manual_inputs=manual_inputs)
+                st.session_state.loaded_from_detail_cache = False
+                st.session_state.detail_cache_age_seconds = None
             st.rerun()
 
 if save_log:
     path = log_daily_decision(d)
     st.success(f"Karar günlüğe kaydedildi: {path}")
 
-with top_right:
-    st.caption(f"Son güncelleme: {d['zaman']}")
+st.caption(f"Son güncelleme: {d['zaman']}")
+
+if st.session_state.get("loaded_from_detail_cache"):
+    age_text = format_age_text(st.session_state.get("detail_cache_age_seconds"))
+    st.markdown(
+        '<div style="background:rgba(250,204,21,0.10);border:1px solid rgba(250,204,21,0.28);'
+        'border-radius:12px;padding:12px 14px;margin-bottom:12px;color:#fde68a;">'
+        f'<b>Planlı detaylı rapor yüklendi</b> &nbsp;|&nbsp; Uygulama açılışını hızlandırmak için son hazırlanmış detaylı rapor disk cache\'inden yüklendi. Yaş: {age_text}.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+if d.get("fast_mode"):
+    st.markdown(
+        '<div style="background:rgba(16,185,129,0.10);border:1px solid rgba(16,185,129,0.28);'
+        'border-radius:12px;padding:12px 14px;margin-bottom:12px;color:#d1fae5;">'
+        '<b>Hızlı mod açık</b> &nbsp;|&nbsp; Uygulama temel karar akışını hızlandırmak için geniş factor seti ve performans raporunu atladı. '
+        'Tam Faz-1 görünümü için sağ üstten <b>Detaylı mod</b> açılabilir.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
+
+@st.fragment(run_every="5s")
+def render_background_detail_status():
+    status = get_background_detail_status()
+    if not status or st.session_state.get("detail_task_mode") != "background":
+        return
+
+    if status.get("status") == "running":
+        st.markdown(
+            '<div style="background:rgba(59,130,246,0.10);border:1px solid rgba(59,130,246,0.28);'
+            'border-radius:12px;padding:12px 14px;margin-bottom:12px;color:#bfdbfe;">'
+            '<b>Arka plan hazırlığı sürüyor</b> &nbsp;|&nbsp; Detaylı Faz-1 raporu hazırlanıyor. Ekranı kullanmaya devam edebilirsin.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    if status.get("status") == "error":
+        st.warning(f"Detaylı rapor arka planda hazırlanamadı: {status.get('error')}")
+        return
+
+    if status.get("status") == "ready":
+        current_data = st.session_state.get("data") or {}
+        if current_data.get("fast_mode"):
+            st.session_state.data = status.get("result")
+            st.session_state.manual_requirements = build_manual_requirements(st.session_state.data)
+            st.session_state.detail_task_mode = "applied"
+            st.success("Detaylı Faz-1 raporu hazırlandı ve ekrana yüklendi.")
+            st.rerun()
+
+
+render_background_detail_status()
 
 # --- Veri Tazeliği ---
 _freshness = d.get("freshness")
@@ -645,7 +844,7 @@ with right:
 
     st.markdown('<div class="panel-card">', unsafe_allow_html=True)
     st.markdown("### Skor Dağılımı")
-    visible_keys = ["DXY", "Faiz", "Risk", "Teknik", "Form", "Volatilite", "MacroRisk"]
+    visible_keys = ["DXY", "Faiz", "Risk", "Teknik", "Form", "Volatilite", "MacroRisk", "Positioning", "SpreadMomentum", "CrossAsset"]
     for k in visible_keys:
         render_score_block(k, d["scores"].get(k, 50), d["yorumlar"][k])
     st.markdown('</div>', unsafe_allow_html=True)
@@ -738,6 +937,27 @@ with m3:
     st.caption(f"Makro kaynak: {d.get('macro_source') or 'N/A'} ({d.get('macro_status') or 'N/A'})")
     st.markdown('</div>', unsafe_allow_html=True)
 
+extra1, extra2 = st.columns(2)
+
+with extra1:
+    st.markdown('<div class="panel-card">', unsafe_allow_html=True)
+    st.markdown("### Positioning")
+    cot = d.get("cot_positioning") or {}
+    st.metric("Net % OI", fmt_num(cot.get("net_pct_open_interest"), 2, "%"))
+    weekly_change = cot.get("weekly_change_contracts")
+    st.metric("Haftalık Değişim", f"{int(weekly_change):+d}" if weekly_change is not None else "N/A")
+    st.caption(f"COT tarih: {cot.get('report_date') or 'N/A'}")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with extra2:
+    st.markdown('<div class="panel-card">', unsafe_allow_html=True)
+    st.markdown("### Cross Asset")
+    ca = d.get("cross_asset") or {}
+    st.metric("S&P 5G", fmt_num(ca.get("spx_ret_5"), 2, "%"))
+    st.metric("Gold 5G", fmt_num(ca.get("gold_ret_5"), 2, "%"))
+    st.metric("Spread Mom. 5G", fmt_num(d.get("spread_2y_momentum_5"), 2, "%"))
+    st.markdown('</div>', unsafe_allow_html=True)
+
 st.markdown('<div class="panel-card">', unsafe_allow_html=True)
 st.markdown("### Veri Kaynakları")
 source_rows = [
@@ -746,10 +966,66 @@ source_rows = [
     ("US 10Y", d.get("us10y_source", "N/A")),
     ("DE 2Y", d.get("de2y_source", "N/A")),
     ("DE 10Y", d.get("de10y_source", "N/A")),
+    ("COT", f"{d.get('cot_source') or 'N/A'} / {d.get('cot_status') or 'N/A'}"),
     ("Makro", f"{d.get('macro_source') or 'N/A'} / {d.get('macro_status') or 'N/A'}"),
 ]
 for label, value in source_rows:
     st.write(f"**{label}:** {value}")
+st.markdown('</div>', unsafe_allow_html=True)
+
+# FORECAST PANELİ
+st.markdown("---")
+st.markdown("## İstatistiksel Tahmin Paneli")
+
+forecast = d.get("forecast", {})
+st.markdown('<div class="panel-card">', unsafe_allow_html=True)
+st.write(forecast.get("summary", "Tahmin üretilemedi."))
+
+forecast_horizons = forecast.get("horizons", {})
+if forecast_horizons:
+    fcols = st.columns(4)
+    for i, h in enumerate([1, 3, 5, 10]):
+        item = forecast_horizons.get(h)
+        if not item:
+            continue
+        with fcols[i]:
+            st.metric(f"{h} Gün", f"{item['direction']} %{item['probability']}")
+            st.caption(f"CI: %{item['ci_lower']:.0f}-%{item['ci_upper']:.0f} | n={item['sample_size']}")
+else:
+    st.warning("İstatistiksel yön tahmini için yeterli benzer dönem bulunamadı.")
+st.markdown('</div>', unsafe_allow_html=True)
+
+# HİBRİT PERFORMANS PANELİ
+st.markdown("---")
+st.markdown("## Hibrit Model Performans Raporu")
+
+hybrid_perf = d.get("hybrid_performance", {})
+st.markdown('<div class="panel-card">', unsafe_allow_html=True)
+st.write(hybrid_perf.get("summary", "Performans raporu üretilemedi."))
+
+models = hybrid_perf.get("models", {})
+if models:
+    perf_cols = st.columns(3)
+    model_order = [
+        ("rule_based", "Kural"),
+        ("forecast", "Forecast"),
+        ("hybrid", "Hybrid"),
+    ]
+    for i, (key, label) in enumerate(model_order):
+        model = models.get(key, {})
+        with perf_cols[i]:
+            st.metric(label, f"%{model.get('overall_accuracy', 0)}")
+            h_parts = []
+            for horizon in [1, 3, 5, 10]:
+                item = model.get("horizons", {}).get(horizon, {})
+                if item.get("n_predictions", 0) > 0:
+                    h_parts.append(f"{horizon}G %{item.get('accuracy', 0)}")
+            st.caption(" | ".join(h_parts) if h_parts else "Horizon verisi yok")
+            calib = model.get("calibration", {})
+            if calib:
+                st.caption(calib.get("summary", "Calibration yok"))
+else:
+    st.warning("Performans karşılaştırması için yeterli tarihsel veri yok.")
 st.markdown('</div>', unsafe_allow_html=True)
 
 # OLASILIK / BACKTEST PANELİ

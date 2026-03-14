@@ -197,6 +197,86 @@ def score_macro_risk(events):
     return round(score, 1), yorum
 
 
+def score_positioning(cot_positioning):
+    if not cot_positioning or cot_positioning.get("net_pct_open_interest") is None:
+        return 50, "COT positioning verisi yok"
+
+    net_pct_oi = float(cot_positioning.get("net_pct_open_interest", 0.0))
+    weekly_change = cot_positioning.get("weekly_change_contracts")
+
+    score = clamp(50 + net_pct_oi * 2.2, 0, 100)
+
+    if weekly_change is not None:
+        score = clamp(score + clamp(float(weekly_change) / 12000, -8, 8), 0, 100)
+
+    if net_pct_oi >= 8:
+        yorum = f"COT kalabalık EUR long (%{net_pct_oi:.1f} OI) → satış lehine"
+    elif net_pct_oi <= -5:
+        yorum = f"COT EUR short (%{net_pct_oi:.1f} OI) → squeeze riski"
+    else:
+        yorum = f"COT nötr/ılımlı (%{net_pct_oi:.1f} OI)"
+
+    if weekly_change is not None:
+        yorum += f" | Haftalık net değişim: {int(weekly_change):+d}"
+
+    return round(score, 1), yorum
+
+
+def score_spread_momentum(spread_momentum_5):
+    if spread_momentum_5 is None:
+        return 50, "Spread momentumu yok"
+
+    score = clamp(50 - spread_momentum_5 * 1.8, 0, 100)
+    if spread_momentum_5 >= 1.0:
+        yorum = f"US-DE 2Y spread açılıyor ({spread_momentum_5:+.2f}%) → EUR baskısı"
+    elif spread_momentum_5 <= -1.0:
+        yorum = f"US-DE 2Y spread daralıyor ({spread_momentum_5:+.2f}%) → EUR destekli"
+    else:
+        yorum = f"US-DE 2Y spread momentumu nötr ({spread_momentum_5:+.2f}%)"
+    return round(score, 1), yorum
+
+
+def score_cross_asset(cross_asset):
+    if not cross_asset:
+        return 50, "Cross-asset verisi yok"
+
+    spx_ret = cross_asset.get("spx_ret_5")
+    eurostoxx_ret = cross_asset.get("eurostoxx_ret_5")
+    gold_ret = cross_asset.get("gold_ret_5")
+    oil_ret = cross_asset.get("oil_ret_5")
+    equity_rel = cross_asset.get("equity_rel_5")
+
+    parts = []
+    score = 50.0
+
+    if spx_ret is not None:
+        score += clamp(-spx_ret * 1.3, -8, 8)
+        parts.append(f"S&P {spx_ret:+.2f}%")
+    if gold_ret is not None:
+        score += clamp(gold_ret * 0.9, -6, 6)
+        parts.append(f"Gold {gold_ret:+.2f}%")
+    if oil_ret is not None:
+        score += clamp(-oil_ret * 0.5, -4, 4)
+        parts.append(f"Oil {oil_ret:+.2f}%")
+    if equity_rel is not None:
+        score += clamp(-equity_rel * 0.8, -5, 5)
+        parts.append(f"EU rel {equity_rel:+.2f}%")
+    elif eurostoxx_ret is not None:
+        parts.append(f"EuroStoxx {eurostoxx_ret:+.2f}%")
+
+    if not parts:
+        return 50, "Cross-asset verisi yok"
+
+    if score >= 58:
+        yorum = f"Risk modu EUR satışı destekliyor | {' | '.join(parts)}"
+    elif score <= 42:
+        yorum = f"Risk modu EUR lehine | {' | '.join(parts)}"
+    else:
+        yorum = f"Cross-asset görünüm karışık | {' | '.join(parts)}"
+
+    return round(clamp(score, 0, 100), 1), yorum
+
+
 def score_data_quality(data_quality):
     if not data_quality:
         return 50, "Veri kalite bilgisi yok"
@@ -281,6 +361,9 @@ def build_scores(bundle):
     macro_score, macro_comment = score_macro_risk(bundle.get("macro_events"))
     dq_score, dq_comment = score_data_quality(bundle.get("data_quality"))
     mom_score, mom_comment = score_momentum(bundle.get("eur_1d"))
+    positioning_score, positioning_comment = score_positioning(bundle.get("cot_positioning"))
+    spread_mom_score, spread_mom_comment = score_spread_momentum(bundle.get("spread_2y_momentum_5"))
+    cross_asset_score, cross_asset_comment = score_cross_asset(bundle.get("cross_asset"))
 
     scores = {
         "DXY": dxy_score,
@@ -292,6 +375,9 @@ def build_scores(bundle):
         "MacroRisk": macro_score,
         "VeriGüveni": dq_score,
         "Momentum": mom_score,
+        "Positioning": positioning_score,
+        "SpreadMomentum": spread_mom_score,
+        "CrossAsset": cross_asset_score,
     }
 
     comments = {
@@ -304,6 +390,9 @@ def build_scores(bundle):
         "MacroRisk": macro_comment,
         "VeriGüveni": dq_comment,
         "Momentum": mom_comment,
+        "Positioning": positioning_comment,
+        "SpreadMomentum": spread_mom_comment,
+        "CrossAsset": cross_asset_comment,
     }
 
     return scores, comments

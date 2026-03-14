@@ -136,6 +136,13 @@ def forecast_direction(
     vix_df=None,
     us2y=None,
     de2y=None,
+    spread_2y_history=None,
+    spx_df=None,
+    eurostoxx_df=None,
+    gold_df=None,
+    oil_df=None,
+    cross_asset=None,
+    cot_positioning=None,
     market_regime: str = "RANGE",
 ) -> dict:
     """Ana tahmin fonksiyonu.
@@ -158,10 +165,29 @@ def forecast_direction(
         }
     """
     # Feature'ları hesapla
-    current = build_feature_row(eur_df, dxy_df, vix_df, us2y, de2y, market_regime)
+    current = build_feature_row(
+        eur_df,
+        dxy_df,
+        vix_df,
+        us2y,
+        de2y,
+        spread_2y_history=spread_2y_history,
+        cross_asset=cross_asset,
+        cot_positioning=cot_positioning,
+        market_regime=market_regime,
+    )
 
     # Tarihsel feature matrix
-    hist_df = build_historical_features(eur_df, dxy_df, vix_df)
+    hist_df = build_historical_features(
+        eur_df,
+        dxy_df,
+        vix_df,
+        spread_2y_history=spread_2y_history,
+        spx_df=spx_df,
+        eurostoxx_df=eurostoxx_df,
+        gold_df=gold_df,
+        oil_df=oil_df,
+    )
 
     if hist_df.empty or len(hist_df) < MIN_NEIGHBORS:
         return {

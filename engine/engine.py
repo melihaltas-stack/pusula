@@ -8,6 +8,8 @@ from core.indicators import technical_snapshot, detect_trend_regime, timeframe_s
 from core.scoring import build_scores
 from planner.planner import build_sale_plan
 from backtest.backtest import build_probability_summary
+from forecast.forecast import forecast_direction
+from forecast.evaluation import evaluate_hybrid_performance
 
 
 LOCAL_TZ = ZoneInfo("Europe/Istanbul")
@@ -50,6 +52,12 @@ HORIZON_META = {
     "long_term": {"label": "Uzun Vade", "window": "4+ hafta"},
 }
 
+FORECAST_HORIZON_MAP = {
+    "short_term": [(3, 0.6), (5, 0.4)],
+    "medium_term": [(5, 0.55), (10, 0.45)],
+    "long_term": [(10, 1.0)],
+}
+
 
 def build_weights(horizon="medium_term", dxy_source=None):
     horizon_weights = {
@@ -57,31 +65,40 @@ def build_weights(horizon="medium_term", dxy_source=None):
             "DXY": 0.14,
             "Faiz": 0.06,
             "Risk": 0.14,
-            "Teknik": 0.20,
+            "Teknik": 0.16,
             "Form": 0.08,
             "Volatilite": 0.08,
             "MacroRisk": 0.06,
-            "Momentum": 0.24,
+            "Momentum": 0.18,
+            "Positioning": 0.04,
+            "SpreadMomentum": 0.06,
+            "CrossAsset": 0.10,
         },
         "medium_term": {
-            "DXY": 0.17,
+            "DXY": 0.14,
             "Faiz": 0.16,
-            "Risk": 0.12,
-            "Teknik": 0.18,
+            "Risk": 0.10,
+            "Teknik": 0.15,
             "Form": 0.10,
             "Volatilite": 0.07,
             "MacroRisk": 0.07,
             "Momentum": 0.13,
+            "Positioning": 0.08,
+            "SpreadMomentum": 0.10,
+            "CrossAsset": 0.10,
         },
         "long_term": {
-            "DXY": 0.12,
-            "Faiz": 0.20,
+            "DXY": 0.10,
+            "Faiz": 0.18,
             "Risk": 0.08,
-            "Teknik": 0.12,
-            "Form": 0.18,
+            "Teknik": 0.10,
+            "Form": 0.15,
             "Volatilite": 0.05,
             "MacroRisk": 0.10,
             "Momentum": 0.15,
+            "Positioning": 0.10,
+            "SpreadMomentum": 0.14,
+            "CrossAsset": 0.10,
         },
     }
 
@@ -95,10 +112,85 @@ def build_weights(horizon="medium_term", dxy_source=None):
         weights["Teknik"] += lost * 0.35
         weights["Momentum"] += lost * 0.30
 
+    total = sum(weights.values())
+    if total > 0:
+        weights = {key: value / total for key, value in weights.items()}
+
     return weights
 
 
-def calculate_ede(scores, horizon="medium_term", dxy_source=None, trend_regime=None):
+def normalize_market_regime(trend_regime):
+    if trend_regime in {"UP", "DOWN"}:
+        return "TREND"
+    return "RANGE"
+
+
+def build_forecast_overlay(forecast_result, horizon="short_term"):
+    if not forecast_result:
+        return {"delta": 0.0, "confidence": 0.0, "summary": "İstatistiksel tahmin yok."}
+
+    horizon_defs = FORECAST_HORIZON_MAP.get(horizon, [])
+    items = []
+    for step, weight in horizon_defs:
+        item = forecast_result.get("horizons", {}).get(step)
+        if item:
+            items.append((step, weight, item))
+
+    if not items:
+        return {"delta": 0.0, "confidence": 0.0, "summary": "İstatistiksel tahmin üretilemedi."}
+
+    total_weight = 0.0
+    weighted_signal = 0.0
+    text_parts = []
+
+    for step, weight, item in items:
+        direction = item.get("direction", "NEUTRAL")
+        probability = float(item.get("probability", 50.0))
+        ci_lower = float(item.get("ci_lower", probability))
+        ci_upper = float(item.get("ci_upper", probability))
+        sample_size = int(item.get("sample_size", 0))
+        ci_width = max(0.0, ci_upper - ci_lower)
+
+        if direction == "DOWN":
+            sign = 1.0
+        elif direction == "UP":
+            sign = -1.0
+        else:
+            sign = 0.0
+
+        edge = abs(probability - 50.0) / 50.0
+        ci_factor = max(0.0, 1.0 - (ci_width / 40.0))
+        sample_factor = min(sample_size / 40.0, 1.0)
+        reliable_factor = 1.0 if item.get("reliable") else 0.65
+        strength = edge * ci_factor * sample_factor * reliable_factor
+
+        weighted_signal += sign * strength * weight
+        total_weight += weight
+        text_parts.append(f"{step}G {direction} %{probability:.0f}")
+
+    if total_weight <= 0:
+        return {"delta": 0.0, "confidence": 0.0, "summary": "İstatistiksel tahmin üretilemedi."}
+
+    normalized_signal = weighted_signal / total_weight
+    delta = round(max(-10.0, min(10.0, normalized_signal * 14.0)), 1)
+    confidence = round(min(abs(normalized_signal) * 100.0, 100.0), 1)
+
+    if delta > 0:
+        direction_text = "satış lehine destekliyor"
+    elif delta < 0:
+        direction_text = "satış lehine zayıflatıyor"
+    else:
+        direction_text = "nötr"
+
+    return {
+        "delta": delta,
+        "confidence": confidence,
+        "summary": f"Forecast {direction_text}: {', '.join(text_parts)}",
+        "horizons_used": [step for step, _, _ in items],
+    }
+
+
+def calculate_ede(scores, horizon="medium_term", dxy_source=None, trend_regime=None, forecast_delta=0.0):
     weights = build_weights(horizon=horizon, dxy_source=dxy_source)
     ede = 0.0
     for key, weight in weights.items():
@@ -113,7 +205,8 @@ def calculate_ede(scores, horizon="medium_term", dxy_source=None, trend_regime=N
             ede -= 8
         elif horizon == "medium_term":
             ede -= 4
-    return round(ede, 1)
+    ede += forecast_delta
+    return round(max(0.0, min(100.0, ede)), 1)
 
 
 def classify_horizon_decision(ede_score, horizon="medium_term"):
@@ -229,25 +322,35 @@ def build_horizon_business_summary(horizon, view, trend_regime, confidence_label
     }
 
 
-def build_horizon_view(horizon, scores, dxy_source, trend_regime, macro_score):
+def build_horizon_view(horizon, scores, dxy_source, trend_regime, macro_score, forecast_overlay=None):
     meta = HORIZON_META[horizon]
-    ede = calculate_ede(scores, horizon=horizon, dxy_source=dxy_source, trend_regime=trend_regime)
+    forecast_overlay = forecast_overlay or {"delta": 0.0, "summary": "İstatistiksel tahmin yok.", "confidence": 0.0}
+    base_ede = calculate_ede(scores, horizon=horizon, dxy_source=dxy_source, trend_regime=trend_regime)
+    ede = calculate_ede(
+        scores,
+        horizon=horizon,
+        dxy_source=dxy_source,
+        trend_regime=trend_regime,
+        forecast_delta=forecast_overlay.get("delta", 0.0),
+    )
     decision = classify_horizon_decision(ede, horizon=horizon)
     sale_plan = build_sale_plan(ede, trend_regime, macro_score, horizon=horizon)
     sorted_weights = sorted(build_weights(horizon=horizon, dxy_source=dxy_source).items(), key=lambda x: x[1], reverse=True)
     focus = ", ".join(name for name, _ in sorted_weights[:3])
-    summary = f"{meta['label']} ({meta['window']}) icin ana odak: {focus}."
+    summary = f"{meta['label']} ({meta['window']}) icin ana odak: {focus}. {forecast_overlay.get('summary', '')}"
     return {
         "key": horizon,
         "label": meta["label"],
         "window": meta["window"],
         "ede": ede,
+        "base_ede": base_ede,
         "karar": decision["karar"],
         "renk": decision["renk"],
         "emoji": decision["emoji"],
         "sale_plan": sale_plan,
         "weights": build_weights(horizon=horizon, dxy_source=dxy_source),
         "summary": summary,
+        "forecast_overlay": forecast_overlay,
     }
 
 
@@ -273,8 +376,8 @@ Sistem ayrıca **veri güven skoru** üretir ve benzer tarihsel koşullara göre
 """
 
 
-def run_engine(manual_inputs=None):
-    bundle = get_market_bundle(manual_inputs=manual_inputs)
+def run_engine(manual_inputs=None, include_extended_data=False, include_performance_report=False):
+    bundle = get_market_bundle(manual_inputs=manual_inputs, include_extended_data=include_extended_data)
 
     eur_1d = bundle.get("eur_1d")
     if eur_1d is None or eur_1d.empty:
@@ -292,6 +395,45 @@ def run_engine(manual_inputs=None):
     data_quality_score = data_quality.get("score", 0)
     confidence_label = classify_confidence(data_quality_score)
 
+    forecast = forecast_direction(
+        bundle.get("eur_1d"),
+        dxy_df=bundle.get("dxy_df"),
+        vix_df=bundle.get("vix_df"),
+        us2y=bundle.get("us2y"),
+        de2y=bundle.get("de2y"),
+        spread_2y_history=bundle.get("spread_2y_history"),
+        spx_df=bundle.get("spx_df"),
+        eurostoxx_df=bundle.get("eurostoxx_df"),
+        gold_df=bundle.get("gold_df"),
+        oil_df=bundle.get("oil_df"),
+        cross_asset=bundle.get("cross_asset"),
+        cot_positioning=bundle.get("cot_positioning"),
+        market_regime=normalize_market_regime(trend_regime),
+    )
+    forecast_overlays = {
+        key: build_forecast_overlay(forecast, horizon=key)
+        for key in ["short_term", "medium_term", "long_term"]
+    }
+    if include_performance_report:
+        hybrid_performance = evaluate_hybrid_performance(
+            bundle.get("eur_1d"),
+            bundle.get("dxy_df"),
+            bundle.get("vix_df"),
+            spread_2y_history=bundle.get("spread_2y_history"),
+            spx_df=bundle.get("spx_df"),
+            eurostoxx_df=bundle.get("eurostoxx_df"),
+            gold_df=bundle.get("gold_df"),
+            oil_df=bundle.get("oil_df"),
+        )
+    else:
+        hybrid_performance = {
+            "models": {},
+            "train_size": 0,
+            "test_size": 0,
+            "best_model": None,
+            "summary": "Hızlı mod açık. Detaylı performans raporu hesaplanmadı.",
+        }
+
     horizon_views = {
         key: build_horizon_view(
             key,
@@ -299,6 +441,7 @@ def run_engine(manual_inputs=None):
             bundle.get("dxy_source"),
             trend_regime,
             scores.get("MacroRisk", 50),
+            forecast_overlay=forecast_overlays.get(key),
         )
         for key in ["short_term", "medium_term", "long_term"]
     }
@@ -312,8 +455,6 @@ def run_engine(manual_inputs=None):
         "emoji": primary_horizon["emoji"],
     }
 
-    sale_plan = primary_horizon["sale_plan"]
-
     technical = technical_snapshot(eur_1d)
     tf_daily = timeframe_snapshot(eur_1d, min_len=100)
     tf_4h = timeframe_snapshot(bundle.get("eur_4h"), min_len=60)
@@ -324,7 +465,23 @@ def run_engine(manual_inputs=None):
         bundle.get("vix_df"),
         ede,
         trend_regime,
+        spread_2y_history=bundle.get("spread_2y_history"),
+        spx_df=bundle.get("spx_df"),
+        eurostoxx_df=bundle.get("eurostoxx_df"),
+        gold_df=bundle.get("gold_df"),
+        oil_df=bundle.get("oil_df"),
+        cross_asset=bundle.get("cross_asset"),
+        cot_positioning=bundle.get("cot_positioning"),
     )
+    sale_plan = build_sale_plan(
+        ede,
+        trend_regime,
+        scores.get("MacroRisk", 50),
+        horizon=primary_horizon["key"],
+        probability_summary=probability,
+        data_quality_score=data_quality_score,
+    )
+    primary_horizon["sale_plan"] = sale_plan
 
     next_macro_event = build_next_macro_event_text(bundle.get("macro_events", []))
     spread_2y = build_spread(bundle.get("us2y"), bundle.get("de2y"))
@@ -357,6 +514,11 @@ def run_engine(manual_inputs=None):
         "de10y_source": bundle.get("de10y_source"),
         "macro_source": bundle.get("macro_source"),
         "macro_status": bundle.get("macro_status"),
+        "cot_positioning": bundle.get("cot_positioning"),
+        "cot_source": bundle.get("cot_source"),
+        "cot_status": bundle.get("cot_status"),
+        "cross_asset": bundle.get("cross_asset"),
+        "spread_2y_momentum_5": bundle.get("spread_2y_momentum_5"),
         "macro_events": bundle.get("macro_events", []),
         "next_macro_event": next_macro_event,
         "eur_1d": bundle.get("eur_1d"),
@@ -379,11 +541,15 @@ def run_engine(manual_inputs=None):
         "sale_plan": sale_plan,
         "horizon_views": horizon_views,
         "probability": probability,
+        "forecast": forecast,
+        "forecast_overlays": forecast_overlays,
+        "hybrid_performance": hybrid_performance,
         "formula_box_text": formula_box_text,
         "freshness": bundle.get("freshness"),
         "validation_flags": bundle.get("validation_flags", []),
         "validation_summary": bundle.get("validation_summary", {}),
         "validation_results": bundle.get("validation_results", {}),
+        "fast_mode": not include_extended_data and not include_performance_report,
     }
 
     result["risk_note"] = build_risk_note(result)
@@ -396,6 +562,7 @@ def run_engine(manual_inputs=None):
             "de10y_source": result["de10y_source"],
             "dxy_source": result["dxy_source"],
             "macro_source": result["macro_source"],
+            "cot_source": result.get("cot_source"),
         },
         "scores": scores,
         "weights": result["weights"],
@@ -403,6 +570,9 @@ def run_engine(manual_inputs=None):
         "data_quality": data_quality,
         "trend_regime": trend_regime,
         "probability": probability,
+        "forecast": forecast,
+        "forecast_overlays": forecast_overlays,
+        "hybrid_performance": hybrid_performance,
         "validation_summary": bundle.get("validation_summary", {}),
         "validation_flags": bundle.get("validation_flags", []),
         "freshness_summary": bundle["freshness"].summary_text if bundle.get("freshness") else "N/A",
@@ -439,11 +609,20 @@ def build_report_text(d):
 | Formasyon | {d['scores']['Form']:.0f} | {d['yorumlar']['Form']} |
 | Volatilite | {d['scores']['Volatilite']:.0f} | {d['yorumlar']['Volatilite']} |
 | Makro Risk | {d['scores']['MacroRisk']:.0f} | {d['yorumlar']['MacroRisk']} |
+| Positioning | {d['scores']['Positioning']:.0f} | {d['yorumlar']['Positioning']} |
+| Spread Mom. | {d['scores']['SpreadMomentum']:.0f} | {d['yorumlar']['SpreadMomentum']} |
+| Cross Asset | {d['scores']['CrossAsset']:.0f} | {d['yorumlar']['CrossAsset']} |
 | Veri Güveni | {d['scores']['VeriGüveni']:.0f} | {d['yorumlar']['VeriGüveni']} |
 
 ---
 
 **🧭 EDE Skoru: {d['ede']} / 100 → {d['emoji']} {d['karar']}**
+
+**İstatistiksel tahmin**
+{d.get('forecast', {}).get('summary', 'Tahmin üretilemedi.')}
+
+**Hibrit performans raporu**
+{d.get('hybrid_performance', {}).get('summary', 'Performans raporu üretilemedi.')}
 
 **Bugünün satış planı**
 - Toplam satış: **{d['sale_plan']['daily_units']} / 100 birim**

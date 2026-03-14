@@ -41,6 +41,9 @@ def build_feature_row(
     vix_df=None,
     us2y: Optional[float] = None,
     de2y: Optional[float] = None,
+    spread_2y_history=None,
+    cross_asset: Optional[dict] = None,
+    cot_positioning: Optional[dict] = None,
     market_regime: str = "RANGE",
 ) -> dict:
     """Tek bir zaman dilimi için özellik vektörü oluşturur.
@@ -128,6 +131,23 @@ def build_feature_row(
     else:
         features["spread_2y"] = None
 
+    if spread_2y_history is not None and len(spread_2y_history) >= 6:
+        features["spread_2y_mom_5"] = _safe_pct_change(spread_2y_history, 5)
+    else:
+        features["spread_2y_mom_5"] = None
+
+    cross_asset = cross_asset or {}
+    for key in ["spx_ret_5", "eurostoxx_ret_5", "gold_ret_5", "oil_ret_5", "equity_rel_5"]:
+        features[key] = cross_asset.get(key)
+
+    cot_positioning = cot_positioning or {}
+    features["cot_net_pct_oi"] = cot_positioning.get("net_pct_open_interest")
+    features["cot_weekly_change_k"] = (
+        cot_positioning.get("weekly_change_contracts") / 1000
+        if cot_positioning.get("weekly_change_contracts") is not None
+        else None
+    )
+
     # ── Rejim (one-hot) ──
     for r in ["RISK_ON", "RISK_OFF", "TREND", "RANGE"]:
         features[f"regime_{r}"] = 1.0 if market_regime == r else 0.0
@@ -147,7 +167,17 @@ def build_feature_row(
     return features
 
 
-def build_historical_features(eur_df, dxy_df, vix_df, min_lookback: int = 120) -> pd.DataFrame:
+def build_historical_features(
+    eur_df,
+    dxy_df,
+    vix_df,
+    spread_2y_history=None,
+    spx_df=None,
+    eurostoxx_df=None,
+    gold_df=None,
+    oil_df=None,
+    min_lookback: int = 120,
+) -> pd.DataFrame:
     """Tarihsel veri üzerinden rolling feature matrix oluşturur.
 
     Walk-forward validation ve model eğitimi için kullanılır.
@@ -192,6 +222,29 @@ def build_historical_features(eur_df, dxy_df, vix_df, min_lookback: int = 120) -
     df["dxy_ret_5"] = df["dxy"].pct_change(5) * 100
     df["vix_norm"] = df["vix"] / 50
 
+    if spread_2y_history is not None and len(spread_2y_history) > 0:
+        spread_series = pd.to_numeric(spread_2y_history, errors="coerce")
+        df["spread_2y"] = spread_series.reindex(df.index)
+        df["spread_2y_mom_5"] = df["spread_2y"].pct_change(5) * 100
+    else:
+        df["spread_2y"] = np.nan
+        df["spread_2y_mom_5"] = np.nan
+
+    for column_name, source_df in {
+        "spx": spx_df,
+        "eurostoxx": eurostoxx_df,
+        "gold": gold_df,
+        "oil": oil_df,
+    }.items():
+        if source_df is not None and not source_df.empty and "Close" in source_df.columns:
+            df[column_name] = pd.to_numeric(source_df["Close"], errors="coerce").reindex(df.index)
+            df[f"{column_name}_ret_5"] = df[column_name].pct_change(5) * 100
+        else:
+            df[column_name] = np.nan
+            df[f"{column_name}_ret_5"] = np.nan
+
+    df["equity_rel_5"] = df["eurostoxx_ret_5"] - df["spx_ret_5"]
+
     # Targets: ileri dönem getiri
     for h in [1, 3, 5, 10]:
         df[f"ret_{h}"] = df["eur"].pct_change(-h).shift(-h) * -100
@@ -210,6 +263,9 @@ def build_historical_features(eur_df, dxy_df, vix_df, min_lookback: int = 120) -
 FEATURE_COLUMNS = [
     "rsi_14", "macd_h", "ma20_ma50_dist", "atr_pct",
     "mom_5", "mom_20", "dxy_ret_3", "dxy_ret_5", "vix_norm",
+    "spread_2y", "spread_2y_mom_5",
+    "spx_ret_5", "eurostoxx_ret_5", "gold_ret_5", "oil_ret_5", "equity_rel_5",
+    "cot_net_pct_oi", "cot_weekly_change_k",
 ]
 
 TARGET_COLUMNS = ["ret_1", "ret_3", "ret_5", "ret_10"]

@@ -42,10 +42,48 @@ def split_execution(units):
     return morning, afternoon
 
 
-def build_sale_plan(ede, trend_regime, macro_score, horizon="medium_term"):
+def apply_realism_brake(units, probability_summary=None, data_quality_score=None):
+    notes = []
+    adjusted = units
+
+    if data_quality_score is not None and data_quality_score < 65:
+        adjusted = max(10, adjusted - 10)
+        notes.append("Veri güveni orta-altı olduğu için satış 10 birim azaltıldı")
+
+    if not probability_summary or probability_summary.get("sample_size", 0) <= 0:
+        return adjusted, " | ".join(notes) if notes else "Olasılık freni uygulanmadı"
+
+    h3 = probability_summary.get("horizons", {}).get(3)
+    if not h3:
+        return adjusted, " | ".join(notes) if notes else "Olasılık freni uygulanmadı"
+
+    prob = h3.get("down_probability", 50)
+    ci_width = h3.get("ci_width", 100)
+    reliable = h3.get("reliable", False)
+    sample_size = probability_summary.get("sample_size", 0)
+
+    if not reliable or sample_size < 20 or ci_width >= 25:
+        adjusted = max(10, adjusted - 10)
+        notes.append("Kısa vade olasılık örneklemi zayıf olduğu için satış 10 birim azaltıldı")
+    elif prob < 52:
+        adjusted = max(10, adjusted - 15)
+        notes.append("3 günlük düşüş olasılığı zayıf olduğu için satış 15 birim azaltıldı")
+    elif prob >= 60 and ci_width <= 18:
+        adjusted = min(100, adjusted + 5)
+        notes.append("3 günlük düşüş olasılığı güçlü olduğu için satış 5 birim artırıldı")
+
+    return adjusted, " | ".join(notes) if notes else "Olasılık freni uygulanmadı"
+
+
+def build_sale_plan(ede, trend_regime, macro_score, horizon="medium_term", probability_summary=None, data_quality_score=None):
     base_units, base_reason = base_units_from_ede(ede, horizon=horizon)
     after_macro, macro_reason = apply_macro_brake(base_units, macro_score)
-    final_units, trend_reason = apply_trend_adjustment(after_macro, trend_regime)
+    after_trend, trend_reason = apply_trend_adjustment(after_macro, trend_regime)
+    final_units, realism_reason = apply_realism_brake(
+        after_trend,
+        probability_summary=probability_summary,
+        data_quality_score=data_quality_score,
+    )
     morning_units, afternoon_units = split_execution(final_units)
 
     if final_units >= 70:
@@ -58,7 +96,7 @@ def build_sale_plan(ede, trend_regime, macro_score, horizon="medium_term"):
         plan_label = "Zorunlu minimum satış"
 
     explanation = (
-        f"{base_reason}. {macro_reason}. {trend_reason}. "
+        f"{base_reason}. {macro_reason}. {trend_reason}. {realism_reason}. "
         f"Bugün toplam {final_units}/100 birim satış önerilir; "
         f"{morning_units} birim sabah, {afternoon_units} birim öğleden sonra."
     )

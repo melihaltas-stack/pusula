@@ -33,6 +33,7 @@ _EURUSD_1D_PERIOD = "2y"
 _EURUSD_4H_PERIOD = "45d"
 _EURUSD_1H_PERIOD = "30d"
 _MARKET_1D_PERIOD = "2y"
+_COT_TTL = 21600
 
 
 def safe_float(x):
@@ -272,6 +273,118 @@ def _http_get_with_retry(url, params=None, timeouts=(3, 5, 8), backoff_seconds=(
     if last_error:
         raise last_error
     raise requests.exceptions.RequestException("HTTP request failed without explicit error")
+
+
+def _parse_numeric(value):
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _series_to_ohlc(series):
+    if series is None or len(series) < 5:
+        return None
+    frame = pd.DataFrame({"Close": pd.to_numeric(series, errors="coerce")}, index=series.index).dropna()
+    if frame.empty:
+        return None
+    frame["Open"] = frame["Close"].shift(1).fillna(frame["Close"])
+    frame["High"] = frame[["Open", "Close"]].max(axis=1)
+    frame["Low"] = frame[["Open", "Close"]].min(axis=1)
+    return _ensure_ohlc(frame[["Open", "High", "Low", "Close"]])
+
+
+def _series_pct_change(series, periods=5):
+    if series is None or len(series) <= periods:
+        return None
+    start = safe_float(series.iloc[-(periods + 1)])
+    end = safe_float(series.iloc[-1])
+    return pct(start, end)
+
+
+def _download_raw_fred_series(series_id, start_date=None):
+    params = {}
+    if start_date:
+        params["cosd"] = start_date
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    response = _http_get_with_retry(url, params=params, timeouts=(10, 15, 20))
+    df = pd.read_csv(StringIO(response.text))
+    if "DATE" not in df.columns or series_id not in df.columns:
+        raise KeyError(f"FRED kolon yok: {series_id}")
+    series = pd.Series(
+        pd.to_numeric(df[series_id], errors="coerce").values,
+        index=pd.to_datetime(df["DATE"], errors="coerce"),
+    ).dropna()
+    if series.empty:
+        raise ValueError(f"FRED seri bos: {series_id}")
+    if series.index.tz is None:
+        series.index = series.index.tz_localize("UTC")
+    return series.sort_index()
+
+
+def _download_raw_ecb_series(url):
+    response = _http_get_with_retry(url, params={"format": "csvdata"}, timeouts=(10, 15, 20))
+    df = pd.read_csv(StringIO(response.text))
+    date_col = next((c for c in df.columns if c.upper() in {"TIME_PERIOD", "DATE"}), None)
+    value_col = next((c for c in df.columns if c.upper() == "OBS_VALUE"), None)
+    if not date_col or not value_col:
+        raise KeyError("ECB kolonlari bulunamadi")
+    series = pd.Series(
+        pd.to_numeric(df[value_col], errors="coerce").values,
+        index=pd.to_datetime(df[date_col], errors="coerce"),
+    ).dropna()
+    if series.empty:
+        raise ValueError("ECB seri bos")
+    if series.index.tz is None:
+        series.index = series.index.tz_localize("UTC")
+    return series.sort_index()
+
+
+def _parse_cot_euro_fx_report(text):
+    start = text.find("EURO FX - CHICAGO MERCANTILE EXCHANGE")
+    if start < 0:
+        raise ValueError("EURO FX bolumu bulunamadi")
+    block = text[start:start + 4000]
+    date_match = re.search(r"Commitments of Traders - Futures Only,\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})", block)
+    all_line = re.search(r"^\s*All\s*:(.*)$", block, re.M)
+    if not all_line:
+        raise ValueError("COT All satiri bulunamadi")
+
+    values = [_parse_numeric(part) for part in all_line.group(1).replace(":", " ").split()]
+    values = [v for v in values if v is not None]
+    if len(values) < 4:
+        raise ValueError("COT verisi yetersiz")
+
+    open_interest, noncom_long, noncom_short, spreading = values[:4]
+    net = noncom_long - noncom_short
+    net_pct_oi = (net / open_interest) * 100 if open_interest else None
+
+    weekly_change = None
+    change_anchor = re.search(r"Changes in Commitments from:.*?\n([^\n]+)", block, re.S)
+    if change_anchor:
+        change_values = [_parse_numeric(part) for part in change_anchor.group(1).replace(":", " ").split()]
+        change_values = [v for v in change_values if v is not None]
+        if len(change_values) >= 4:
+            weekly_change = change_values[1] - change_values[2]
+
+    return {
+        "report_date": date_match.group(1) if date_match else None,
+        "open_interest": int(open_interest),
+        "noncommercial_long": int(noncom_long),
+        "noncommercial_short": int(noncom_short),
+        "spreading": int(spreading),
+        "net_contracts": int(net),
+        "net_pct_open_interest": round(net_pct_oi, 2) if net_pct_oi is not None else None,
+        "weekly_change_contracts": int(weekly_change) if weekly_change is not None else None,
+    }
 
 
 def _download_ecb_eurusd_history():
@@ -603,6 +716,78 @@ def get_yahoo(ticker, interval="1d", period="6mo"):
         return fallback_df, stamp(f"{ticker}_alt")
 
     return None, fetched_at
+
+
+@st.cache_data(ttl=_TTL_RATES, show_spinner=False)
+def get_us2y_history():
+    fetched_at = stamp("us2y_history")
+    cache_key = "fred_DGS2_history"
+    try:
+        df = _series_to_ohlc(_download_raw_fred_series("DGS2"))
+        if df is not None and not df.empty:
+            _save_dataframe_cache(cache_key, df)
+            return df, fetched_at
+    except (requests.exceptions.RequestException, pd.errors.ParserError, ValueError, KeyError) as e:
+        logger.warning("get_us2y_history: %s", e)
+
+    cached_df, cached_at = _load_dataframe_cache(cache_key)
+    return cached_df, cached_at or fetched_at
+
+
+@st.cache_data(ttl=_TTL_RATES, show_spinner=False)
+def get_de2y_history():
+    fetched_at = stamp("de2y_history")
+    cache_key = "ecb_DE2Y_history"
+    try:
+        df = _series_to_ohlc(_download_raw_ecb_series("https://data-api.ecb.europa.eu/service/data/YC/B.U2.EUR.4F.G_N_A.SV_C_YM.SR_2Y"))
+        if df is not None and not df.empty:
+            _save_dataframe_cache(cache_key, df)
+            return df, fetched_at
+    except (requests.exceptions.RequestException, pd.errors.ParserError, ValueError, KeyError) as e:
+        logger.warning("get_de2y_history: %s", e)
+
+    cached_df, cached_at = _load_dataframe_cache(cache_key)
+    return cached_df, cached_at or fetched_at
+
+
+@st.cache_data(ttl=_COT_TTL, show_spinner=False)
+def get_cot_positioning_with_source():
+    fetched_at = stamp("cot_positioning")
+    cache_key = "cftc_euro_fx_cot"
+    url = "https://www.cftc.gov/dea/futures/deacmelf.htm"
+    try:
+        response = _http_get_with_retry(url, timeouts=(5, 8, 12))
+        if response.status_code == 200 and response.text:
+            parsed = _parse_cot_euro_fx_report(response.text)
+            payload = {
+                **parsed,
+                "source": "CFTC:EURO_FX_FUTURES_ONLY",
+                "status": "ok",
+                "fetched_at": fetched_at.isoformat(),
+            }
+            _save_dict_cache(cache_key, payload)
+            payload["fetched_at"] = fetched_at
+            return payload
+    except (requests.exceptions.RequestException, ValueError, KeyError) as e:
+        logger.warning("get_cot_positioning_with_source: %s", e)
+
+    cached, cached_at = _load_dict_cache(cache_key)
+    if cached:
+        return {
+            **cached,
+            "status": "stale-cache",
+            "fetched_at": cached_at,
+        }
+
+    return {
+        "net_contracts": None,
+        "net_pct_open_interest": None,
+        "weekly_change_contracts": None,
+        "report_date": None,
+        "source": None,
+        "status": "missing",
+        "fetched_at": fetched_at,
+    }
 
 
 @st.cache_data(ttl=_TTL_RATES, show_spinner=False)
@@ -959,18 +1144,26 @@ def build_data_quality(checks: dict):
 
 
 @st.cache_data(ttl=_TTL_SPOT, show_spinner=False)
-def get_market_bundle(manual_inputs=None):
+def get_market_bundle(manual_inputs=None, include_extended_data=False):
     manual_inputs = manual_inputs or {}
     manual_mode = bool(manual_inputs)
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=14) as executor:
         futures = {
             "eur_1d": executor.submit(get_yahoo, "EURUSD=X", "1d", _EURUSD_1D_PERIOD),
             "eur_4h": executor.submit(get_yahoo, "EURUSD=X", "4h", _EURUSD_4H_PERIOD),
             "de2y": executor.submit(get_de2y_with_source),
             "de10y": executor.submit(get_de10y_with_source),
             "macro": executor.submit(get_macro_events_with_source),
+            "cot": executor.submit(get_cot_positioning_with_source),
         }
+        if include_extended_data:
+            futures["us2y_hist"] = executor.submit(get_us2y_history)
+            futures["de2y_hist"] = executor.submit(get_de2y_history)
+            futures["spx"] = executor.submit(get_yahoo, "^GSPC", "1d", _MARKET_1D_PERIOD)
+            futures["eurostoxx"] = executor.submit(get_yahoo, "FEZ", "1d", _MARKET_1D_PERIOD)
+            futures["gold"] = executor.submit(get_yahoo, "GLD", "1d", _MARKET_1D_PERIOD)
+            futures["oil"] = executor.submit(get_yahoo, "USO", "1d", _MARKET_1D_PERIOD)
 
         if manual_inputs.get("dxy_pct") is None:
             futures["dxy"] = executor.submit(get_yahoo, "DX-Y.NYB", "1d", _MARKET_1D_PERIOD)
@@ -986,6 +1179,13 @@ def get_market_bundle(manual_inputs=None):
         de2y_info = futures["de2y"].result()
         de10y_info = futures["de10y"].result()
         macro_info = futures["macro"].result()
+        cot_info = futures["cot"].result()
+        us2y_hist_df, ts_us2y_hist = (futures["us2y_hist"].result() if "us2y_hist" in futures else (None, None))
+        de2y_hist_df, ts_de2y_hist = (futures["de2y_hist"].result() if "de2y_hist" in futures else (None, None))
+        spx_df, ts_spx = (futures["spx"].result() if "spx" in futures else (None, None))
+        eurostoxx_df, ts_eurostoxx = (futures["eurostoxx"].result() if "eurostoxx" in futures else (None, None))
+        gold_df, ts_gold = (futures["gold"].result() if "gold" in futures else (None, None))
+        oil_df, ts_oil = (futures["oil"].result() if "oil" in futures else (None, None))
 
     if eur_4h is None or eur_4h.empty:
         eur_1h, ts_eur_1h = get_yahoo("EURUSD=X", "1h", _EURUSD_1H_PERIOD)
@@ -1058,6 +1258,30 @@ def get_market_bundle(manual_inputs=None):
     else:
         vix_val = safe_float(vix_df["Close"].iloc[-1]) if vix_df is not None and not vix_df.empty else None
 
+    spread_2y_history = None
+    spread_2y_momentum_5 = None
+    if us2y_hist_df is not None and de2y_hist_df is not None and not us2y_hist_df.empty and not de2y_hist_df.empty:
+        spread_df = pd.DataFrame(
+            {
+                "us2y": pd.to_numeric(us2y_hist_df["Close"], errors="coerce"),
+                "de2y": pd.to_numeric(de2y_hist_df["Close"], errors="coerce"),
+            }
+        ).dropna()
+        if not spread_df.empty:
+            spread_2y_history = spread_df["us2y"] - spread_df["de2y"]
+            spread_2y_momentum_5 = _series_pct_change(spread_2y_history, periods=5)
+
+    cross_asset = {
+        "spx_ret_5": _series_pct_change(spx_df["Close"], periods=5) if spx_df is not None and not spx_df.empty else None,
+        "eurostoxx_ret_5": _series_pct_change(eurostoxx_df["Close"], periods=5) if eurostoxx_df is not None and not eurostoxx_df.empty else None,
+        "gold_ret_5": _series_pct_change(gold_df["Close"], periods=5) if gold_df is not None and not gold_df.empty else None,
+        "oil_ret_5": _series_pct_change(oil_df["Close"], periods=5) if oil_df is not None and not oil_df.empty else None,
+    }
+    if cross_asset["spx_ret_5"] is not None and cross_asset["eurostoxx_ret_5"] is not None:
+        cross_asset["equity_rel_5"] = round(cross_asset["eurostoxx_ret_5"] - cross_asset["spx_ret_5"], 2)
+    else:
+        cross_asset["equity_rel_5"] = None
+
     checks = {
         "EURUSD_1D": eur_1d is not None and not eur_1d.empty,
         "EURUSD_4H": eur_4h is not None and not eur_4h.empty,
@@ -1067,6 +1291,9 @@ def get_market_bundle(manual_inputs=None):
         "US10Y":     us10y_info["value"] is not None,
         "DE2Y":      de2y_info["value"]  is not None,
         "DE10Y":     de10y_info["value"] is not None,
+        "COT":       cot_info.get("net_contracts") is not None,
+        "SPREAD_2Y_HISTORY": (spread_2y_history is not None and len(spread_2y_history) >= 20) if include_extended_data else True,
+        "CROSS_ASSET": (sum(1 for key in ("spx_ret_5", "eurostoxx_ret_5", "gold_ret_5", "oil_ret_5") if cross_asset.get(key) is not None) >= 3) if include_extended_data else True,
     }
 
     # Tazelik hesapla
@@ -1080,6 +1307,13 @@ def get_market_bundle(manual_inputs=None):
         "de2y":         de2y_info.get("fetched_at"),
         "de10y":        de10y_info.get("fetched_at"),
         "macro_events": macro_info.get("fetched_at"),
+        "cot":          cot_info.get("fetched_at"),
+        "us2y_hist":    ts_us2y_hist,
+        "de2y_hist":    ts_de2y_hist,
+        "spx_df":       ts_spx,
+        "eurostoxx_df": ts_eurostoxx,
+        "gold_df":      ts_gold,
+        "oil_df":       ts_oil,
     })
 
     bundle = {
@@ -1096,12 +1330,24 @@ def get_market_bundle(manual_inputs=None):
         "us10y":       us10y_info["value"],
         "de2y":        de2y_info["value"],
         "de10y":       de10y_info["value"],
+        "us2y_hist":   us2y_hist_df,
+        "de2y_hist":   de2y_hist_df,
+        "spread_2y_history": spread_2y_history,
+        "spread_2y_momentum_5": spread_2y_momentum_5,
         "us2y_source":  us2y_info["source"],
         "us10y_source": us10y_info["source"],
         "de2y_source":  de2y_info["source"],
         "de10y_source": de10y_info["source"],
         "dxy_source":   dxy_source_override or "YAHOO_OR_FRED",
         "manual_mode":  manual_mode,
+        "cot_positioning": cot_info,
+        "cot_source": cot_info.get("source"),
+        "cot_status": cot_info.get("status"),
+        "spx_df": spx_df,
+        "eurostoxx_df": eurostoxx_df,
+        "gold_df": gold_df,
+        "oil_df": oil_df,
+        "cross_asset": cross_asset,
         "macro_events": macro_info["events"],
         "macro_source": macro_info["source"],
         "macro_status": macro_info["status"],
